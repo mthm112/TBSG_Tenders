@@ -555,8 +555,12 @@ def scan_directory(ftp, current_path):
         
         ftp.retrlines('LIST', process_line)
         
-        # Scan subdirectories recursively
+        # Scan subdirectories recursively (skip . and .. to avoid infinite loops)
         for dir_name in directories:
+            # CRITICAL: Skip current (.) and parent (..) directories
+            if dir_name in ['.', '..']:
+                continue
+                
             try:
                 original_dir = ftp.pwd()
                 ftp.cwd(dir_name)
@@ -665,8 +669,12 @@ def process_directory(ftp, current_path, assistant):
                     }
                 })
         
-        # Process subdirectories recursively
+        # Process subdirectories recursively (skip . and .. to avoid infinite loops)
         for dir_name in directories:
+            # CRITICAL: Skip current (.) and parent (..) directories
+            if dir_name in ['.', '..']:
+                continue
+                
             try:
                 original_dir = ftp.pwd()
                 logging.info(f"Entering subdirectory: {current_path}/{dir_name}")
