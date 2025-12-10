@@ -507,6 +507,35 @@ def process_file(file_path, file_name, current_path, assistant):
         file_counters['failed'] += 1
         return False
 
+def navigate_to_ftp_folder(ftp, folder_path):
+    """Navigate to FTP folder step-by-step to handle paths with spaces."""
+    try:
+        # Start from root
+        ftp.cwd('/')
+        
+        # Split path into parts
+        parts = [p for p in folder_path.split('/') if p]
+        
+        logging.info(f"Navigating to {folder_path} in {len(parts)} steps...")
+        
+        # Navigate step by step
+        current = '/'
+        for part in parts:
+            try:
+                ftp.cwd(part)
+                current = f"{current}{part}/"
+                logging.info(f"  ✓ Navigated to: {current}")
+            except ftplib.error_perm as e:
+                logging.error(f"  ✗ Failed to navigate to '{part}': {str(e)}")
+                raise Exception(f"Cannot access folder '{part}' in path '{folder_path}'")
+        
+        logging.info(f"Successfully navigated to {folder_path}")
+        return True
+        
+    except Exception as e:
+        logging.error(f"Failed to navigate to {folder_path}: {str(e)}")
+        raise
+
 def scan_directory(ftp, current_path):
     """Scan directory to count files (for progress tracking)."""
     file_count = 0
@@ -565,7 +594,9 @@ def process_directory(ftp, current_path, assistant):
         ftp.retrlines('LIST', process_line)
         
         if len(files) > 0:
-            log_progress('directory', f"Found {len(files)} files in {current_path}")
+            # Increment total counter as we discover files (no pre-scan needed)
+            file_counters['total'] += len(files)
+            log_progress('directory', f"Found {len(files)} files in {current_path} (total so far: {file_counters['total']})")
         
         # Process files in the current directory
         for file_name in files:
@@ -622,9 +653,10 @@ def process_directory(ftp, current_path, assistant):
                 })
                 file_counters['failed'] += 1
                 
-            # Update progress
-            if file_counters['processed'] % 5 == 0 or file_counters['processed'] == file_counters['total']:
-                log_progress('progress', f"Processed {file_counters['processed']}/{file_counters['total']} files", {
+            # Update progress (works even if total is still being discovered)
+            if file_counters['processed'] % 5 == 0:
+                total_msg = f"{file_counters['total']}+" if file_counters['processed'] < file_counters['total'] else str(file_counters['total'])
+                log_progress('progress', f"Processed {file_counters['processed']}/{total_msg} files", {
                     'progress': {
                         'current': file_counters['processed'],
                         'total': file_counters['total'],
@@ -792,23 +824,17 @@ def main():
         max_retries = 3
         retry_delay = 5
         
-        # Scan to count total files for progress tracking
-        logging.info(f"Scanning {FTP_FOLDER} directory to count files...")
-        log_progress('scan', f"Scanning {FTP_FOLDER} directory structure for files...")
+        # OPTIMIZATION: Skip slow scan phase - process files directly
+        # The scan was taking 10+ minutes for ~65 files due to FTP connection delays
+        # File count will be tracked during processing instead
+        logging.info(f"Starting file processing in {FTP_FOLDER}...")
+        log_progress('scan', f"Processing files in {FTP_FOLDER} (count will be determined during processing)")
         
-        # Navigate to the correct folder path
-        ftp.cwd(FTP_FOLDER)
-        file_counters['total'] = scan_directory(ftp, FTP_FOLDER)
+        # Navigate to the correct folder path (handles spaces and nested paths)
+        navigate_to_ftp_folder(ftp, FTP_FOLDER)
         
-        logging.info(f"Found {file_counters['total']} files to process in {FTP_FOLDER}")
-        log_progress('scan', f"Found {file_counters['total']} files to process in {FTP_FOLDER}", {
-            'progress': {
-                'total': file_counters['total']
-            }
-        })
-        
-        # Return to root directory and start processing
-        ftp.cwd('/')
+        # Set total to 0 - will be incremented during processing
+        file_counters['total'] = 0
         
         for attempt in range(max_retries):
             try:
@@ -823,9 +849,9 @@ def main():
                     logging.info(f"Reconnected to FTP server (attempt {attempt+1})")
                     log_progress('connect', f"Reconnected to FTP server (attempt {attempt+1})")
                 
-                # Navigate to the correct folder path
-                ftp.cwd(FTP_FOLDER)
-                log_progress('processing', f"Starting to process {file_counters['total']} files for {ASSISTANT_NAME}")
+                # Navigate to the correct folder path (handles spaces and nested paths)
+                navigate_to_ftp_folder(ftp, FTP_FOLDER)
+                log_progress('processing', f"Starting to process files for {ASSISTANT_NAME}")
                 process_directory(ftp, FTP_FOLDER, assistant)
                 break
             except Exception as e:
