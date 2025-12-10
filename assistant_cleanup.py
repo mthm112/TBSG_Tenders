@@ -215,8 +215,22 @@ def assistant_exists(pc, assistant_name):
     """Check if an assistant exists with timeout"""
     try:
         def check():
-            assistants = pc.assistant.list_assistants()
-            return any(a['name'] == assistant_name for a in assistants['assistants'])
+            response = pc.assistant.list_assistants()
+            # Handle different response formats
+            if hasattr(response, 'assistants'):
+                assistants_list = response.assistants
+            elif isinstance(response, dict) and 'assistants' in response:
+                assistants_list = response['assistants']
+            else:
+                # If response is already a list
+                assistants_list = response if isinstance(response, list) else []
+            
+            # Check each assistant
+            for assistant in assistants_list:
+                name = assistant.name if hasattr(assistant, 'name') else assistant.get('name')
+                if name == assistant_name:
+                    return True
+            return False
         
         with ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(check)
