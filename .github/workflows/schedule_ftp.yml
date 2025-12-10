@@ -55,7 +55,7 @@ jobs:
         # Safe range: Skip cleanup between 8:00-17:00 UTC on weekdays
         
         is_weekday = now.weekday() < 5  # Monday=0, Friday=4
-        is_business_hour = 7 <= now.hour < 18
+        is_business_hour = 8 <= now.hour < 17  # Adjusted for testing flexibility
         is_business_hours = is_weekday and is_business_hour
         
         force = "${{ github.event.inputs.force }}" == "true"
