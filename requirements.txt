@@ -1,0 +1,11 @@
+# Python dependencies for TBSG FTP to Pinecone sync
+# Upload this file to the root of your repository
+
+pinecone>=7.0.0
+pinecone-plugin-assistant>=1.6.0
+requests>=2.32.0
+python-dateutil>=2.9.0
+PyPDF2>=3.0.0
+pdf2image>=1.16.0
+pytesseract>=0.3.10
+Pillow>=10.0.0
