@@ -33,7 +33,7 @@ logging.basicConfig(
 PINECONE_API_KEY = os.environ.get('PINECONE_API_KEY')
 SUPABASE_URL = os.environ.get('SUPABASE_URL')
 SUPABASE_KEY = os.environ.get('SUPABASE_KEY')
-GITHUB_TOKEN = os.environ.get('GITHUB_PERSONAL_ACCESS_TOKEN')
+GITHUB_TOKEN = os.environ.get('GITHUB_TOKEN')  # Built-in GitHub Actions token
 GITHUB_OWNER = os.environ.get('GITHUB_OWNER', 'mthm112')
 GITHUB_REPO = os.environ.get('GITHUB_REPO', 'TBSG_Tenders')
 
