@@ -154,7 +154,8 @@ def is_business_hours():
     # GMT (winter): 9am-5pm UK = 9:00-17:00 UTC
     # BST (summer): 9am-5pm UK = 8:00-16:00 UTC
     # Safe range: 8:00-17:00 UTC covers both scenarios
-    is_business_hour = 7 <= now.hour < 18
+    # Adjusted to end at 5pm UTC for testing flexibility
+    is_business_hour = 8 <= now.hour < 17
     
     is_business = is_weekday and is_business_hour
     
