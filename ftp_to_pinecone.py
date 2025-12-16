@@ -76,9 +76,9 @@ ASSISTANT_INSTRUCTIONS = """You are a TBSG tender and policy assistant specializ
 
 CORE REQUIREMENTS:
 1. Language: Use British English spelling and terminology throughout all responses
-2. Accuracy: Provide clear, factual answers using only the uploaded TBSG documents
-3. Citations: Always reference the source document using the 'original_filename' metadata field and specific page numbers
-4. Format: "According to [original_filename], page X..."
+2. Accuracy: Provide clear, factual answers using only the uploaded TBSG documents (PDFs, Word documents, Excel files, etc.)
+3. Citations: Always reference the source document using the 'original_filename' metadata field and specific page numbers where applicable
+4. Format: "According to [original_filename], page X..." (or "According to [original_filename]..." if page numbers aren't available)
 
 RESPONSE GUIDELINES:
 1. Specificity: When asked for "a" or "the" (singular), provide ONLY ONE option, not multiple
@@ -317,7 +317,10 @@ def upload_file_to_assistant(assistant, file_path, original_filename):
     return False
 
 def process_directory(ftp, base_path, assistant):
-    """Process all PDF files in the directory with comprehensive diagnostics."""
+    """
+    Process all files in the directory with comprehensive diagnostics.
+    Supports: PDF, DOCX, XLSX, PPTX, TXT, and other document formats supported by Pinecone.
+    """
     try:
         current_dir = ftp.pwd()
         logging.info(f"📁 Processing directory: {current_dir}")
@@ -327,58 +330,50 @@ def process_directory(ftp, base_path, assistant):
         
         logging.info(f"📊 Found {len(files)} files and {len(directories)} subdirectories")
         
-        # Categorize files
-        pdf_files = [f for f in files if f.lower().endswith('.pdf')]
-        other_files = [f for f in files if not f.lower().endswith('.pdf')]
-        
-        # Log summary
+        # Log summary - process ALL files, not just PDFs
         logging.info(f"📊 Directory Summary for {current_dir}:")
-        logging.info(f"  - PDF Files: {len(pdf_files)}")
-        logging.info(f"  - Other Files: {len(other_files)}")
+        logging.info(f"  - Total Files: {len(files)}")
         logging.info(f"  - Subdirectories: {len(directories)}")
         
-        if pdf_files:
-            logging.info(f"📄 PDF Files to process: {pdf_files[:10]}")  # Show first 10
+        if files:
+            logging.info(f"📄 Files to process: {files[:10]}")  # Show first 10
         else:
-            logging.info(f"⚠️ No PDF files in this directory")
-        
-        if other_files:
-            logging.info(f"  Other files: {other_files[:5]}")
+            logging.info(f"⚠️ No files in this directory")
         
         if directories:
             logging.info(f"  Subdirectories: {directories}")
         
-        # Process PDF files in current directory
-        for pdf_file in pdf_files:
+        # Process ALL files in current directory (PDFs, DOCX, XLSX, etc.)
+        for file_to_process in files:
             file_counters['total'] += 1
             file_counters['processed'] += 1
             
             log_progress('processing', 
-                       f"Processing file {file_counters['processed']}: {pdf_file}",
-                       {'file': pdf_file, 'directory': current_dir})
+                       f"Processing file {file_counters['processed']}: {file_to_process}",
+                       {'file': file_to_process, 'directory': current_dir})
             
             # Create temp directory
             temp_dir = tempfile.mkdtemp()
             # Use original filename in temp directory
-            temp_pdf_path = os.path.join(temp_dir, pdf_file)
+            temp_file_path = os.path.join(temp_dir, file_to_process)
             
             try:
                 # Download the file
-                with open(temp_pdf_path, 'wb') as local_file:
-                    ftp.retrbinary(f'RETR {pdf_file}', local_file.write)
+                with open(temp_file_path, 'wb') as local_file:
+                    ftp.retrbinary(f'RETR {file_to_process}', local_file.write)
                 
                 # Upload to assistant
-                if upload_file_to_assistant(assistant, temp_pdf_path, pdf_file):
+                if upload_file_to_assistant(assistant, temp_file_path, file_to_process):
                     file_counters['succeeded'] += 1
                 else:
                     file_counters['failed'] += 1
                     
             except Exception as e:
-                logging.error(f"Error processing {pdf_file}: {str(e)}")
+                logging.error(f"Error processing {file_to_process}: {str(e)}")
                 file_counters['failed'] += 1
-                problematic_files['processing_failed'].append(pdf_file)
-                log_progress('error', f"Error processing {pdf_file}", {
-                    'file': pdf_file,
+                problematic_files['processing_failed'].append(file_to_process)
+                log_progress('error', f"Error processing {file_to_process}", {
+                    'file': file_to_process,
                     'error': str(e)
                 }, 'error')
             finally:
@@ -524,7 +519,7 @@ def main():
         
         # Navigate to folder
         logging.info(f"Starting file processing in {FTP_FOLDER}...")
-        log_progress('scan', f"Processing files in {FTP_FOLDER}")
+        log_progress('scan', f"Processing all document types in {FTP_FOLDER}")
         
         navigate_to_ftp_folder(ftp, FTP_FOLDER)
         
