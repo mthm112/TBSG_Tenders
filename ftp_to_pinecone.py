@@ -287,12 +287,11 @@ def upload_file_to_assistant(assistant, file_path, original_filename):
     
     for attempt in range(max_retries):
         try:
-            with open(file_path, "rb") as f:
-                upload_response = assistant.upload_file(
-                    file_name=original_filename,
-                    file_data=f,
-                    timeout=120
-                )
+            # Upload file - Pinecone will use the actual file path's name
+            upload_response = assistant.upload_file(
+                file_path=file_path,
+                timeout=120
+            )
             
             logging.info(f"✓ Successfully uploaded: {original_filename}")
             log_progress('upload', f"Successfully uploaded: {original_filename}", {
@@ -358,9 +357,10 @@ def process_directory(ftp, base_path, assistant):
                        f"Processing file {file_counters['processed']}: {pdf_file}",
                        {'file': pdf_file, 'directory': current_dir})
             
-            temp_pdf = tempfile.NamedTemporaryFile(delete=False, suffix='.pdf')
-            temp_pdf_path = temp_pdf.name
-            temp_pdf.close()
+            # Create temp directory
+            temp_dir = tempfile.mkdtemp()
+            # Use original filename in temp directory
+            temp_pdf_path = os.path.join(temp_dir, pdf_file)
             
             try:
                 # Download the file
@@ -382,8 +382,9 @@ def process_directory(ftp, base_path, assistant):
                     'error': str(e)
                 }, 'error')
             finally:
-                if os.path.exists(temp_pdf_path):
-                    os.unlink(temp_pdf_path)
+                # Clean up temp directory
+                if os.path.exists(temp_dir):
+                    shutil.rmtree(temp_dir)
         
         # Process subdirectories recursively
         for subdir in directories:
