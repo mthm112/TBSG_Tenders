@@ -69,7 +69,7 @@ ASSISTANT_REGION = os.environ.get('ASSISTANT_REGION', 'us')
 
 # Log the configuration
 logging.info(f"Using assistant: {ASSISTANT_NAME}")
-logging.info(f"Using FTP folder: {ASSISTANT_NAME}")
+logging.info(f"Using FTP folder: {FTP_FOLDER}")  # FIXED: Was logging ASSISTANT_NAME
 
 # TBSG-Specific Assistant Instructions with Barney's feedback incorporated
 ASSISTANT_INSTRUCTIONS = """You are a TBSG tender and policy assistant specialized in creating accurate, professional tender responses for the Business Supplies Group.
@@ -272,6 +272,33 @@ def navigate_to_ftp_folder(ftp, folder_path):
         logging.error(f"Failed to navigate to folder {folder_path}: {str(e)}")
         raise
 
+def verify_ftp_path(ftp, expected_path):
+    """
+    Verify we can access the FTP path and list its contents
+    """
+    try:
+        current = ftp.pwd()
+        logging.info(f"📍 Current FTP directory: {current}")
+        
+        # Try to list contents using NLST
+        items = ftp.nlst()
+        logging.info(f"✓ Directory listing successful: {len(items)} items found")
+        
+        # Try using LIST instead of NLST for more details
+        try:
+            detailed = []
+            ftp.retrlines('LIST', detailed.append)
+            logging.info(f"📋 Detailed listing (first 5 items):")
+            for line in detailed[:5]:
+                logging.info(f"  {line}")
+        except Exception as e:
+            logging.warning(f"Could not get detailed listing: {e}")
+        
+        return True, items
+    except Exception as e:
+        logging.error(f"❌ Failed to verify FTP path: {e}")
+        return False, []
+
 def upload_file_to_assistant(assistant, file_path, original_filename):
     """Upload a file to Pinecone assistant with retry logic."""
     max_retries = 3
@@ -310,65 +337,112 @@ def upload_file_to_assistant(assistant, file_path, original_filename):
     return False
 
 def process_directory(ftp, base_path, assistant):
-    """Process all PDF files in the directory."""
+    """Process all PDF files in the directory with comprehensive diagnostics."""
     try:
+        # Get current location
+        current_dir = ftp.pwd()
+        logging.info(f"📁 Processing directory: {current_dir}")
+        
+        # Get all items
         items = ftp.nlst()
+        logging.info(f"📊 Found {len(items)} total items")
+        
+        # Check if empty
+        if not items:
+            error_msg = f"❌ EMPTY DIRECTORY: No files found in {current_dir}"
+            logging.error(error_msg)
+            log_progress('error', error_msg, {
+                'directory': current_dir,
+                'expected_path': base_path
+            }, 'error')
+            return
+        
+        # Categorize items
+        pdf_files = []
+        subdirs = []
+        other_files = []
         
         for item in items:
             try:
-                # Try to CWD into it - if it works, it's a directory
-                current_dir = ftp.pwd()
+                # Check if it's a directory
+                current_pwd = ftp.pwd()
                 try:
                     ftp.cwd(item)
-                    # It's a directory, process it recursively
-                    logging.info(f"Entering subdirectory: {item}")
-                    process_directory(ftp, f"{base_path}/{item}", assistant)
-                    ftp.cwd('..')  # Go back up
+                    subdirs.append(item)
+                    ftp.cwd(current_pwd)  # Go back to original directory
                 except ftplib.error_perm:
-                    # It's a file, not a directory
+                    # It's a file
                     if item.lower().endswith('.pdf'):
-                        file_counters['total'] += 1
-                        file_counters['processed'] += 1
-                        
-                        # Log progress
-                        log_progress('processing', 
-                                   f"Processing file {file_counters['processed']}: {item}",
-                                   {'file': item, 'progress': f"{file_counters['processed']} files"})
-                        
-                        # Create temp file with sanitized name
-                        sanitized_name = sanitize_filename(item)
-                        temp_pdf = tempfile.NamedTemporaryFile(delete=False, suffix='.pdf')
-                        temp_pdf_path = temp_pdf.name
-                        temp_pdf.close()
-                        
-                        try:
-                            # Download the file
-                            with open(temp_pdf_path, 'wb') as local_file:
-                                ftp.retrbinary(f'RETR {item}', local_file.write)
-                            
-                            # Upload to assistant
-                            if upload_file_to_assistant(assistant, temp_pdf_path, item):
-                                file_counters['succeeded'] += 1
-                            else:
-                                file_counters['failed'] += 1
-                                
-                        except Exception as e:
-                            logging.error(f"Error processing {item}: {str(e)}")
-                            file_counters['failed'] += 1
-                            problematic_files['processing_failed'].append(item)
-                            log_progress('error', f"Error processing {item}", {
-                                'file': item,
-                                'error': str(e)
-                            }, 'error')
-                        finally:
-                            # Clean up temp file
-                            if os.path.exists(temp_pdf_path):
-                                os.unlink(temp_pdf_path)
+                        pdf_files.append(item)
                     else:
-                        logging.debug(f"Skipping non-PDF file: {item}")
-                        
+                        other_files.append(item)
             except Exception as e:
-                logging.error(f"Error processing item {item}: {str(e)}")
+                logging.warning(f"Could not categorize {item}: {e}")
+        
+        # Log summary
+        logging.info(f"📊 Directory Summary for {current_dir}:")
+        logging.info(f"  - PDF Files: {len(pdf_files)}")
+        logging.info(f"  - Subdirectories: {len(subdirs)}")
+        logging.info(f"  - Other Files: {len(other_files)}")
+        
+        if pdf_files:
+            logging.info(f"📄 PDF Files to process: {pdf_files}")
+        else:
+            logging.warning(f"⚠️ NO PDF FILES FOUND in {current_dir}!")
+            if other_files:
+                logging.info(f"  Other files present: {other_files[:5]}")
+            if subdirs:
+                logging.info(f"  Subdirectories found: {subdirs}")
+        
+        # Process PDFs
+        for item in pdf_files:
+            file_counters['total'] += 1
+            file_counters['processed'] += 1
+            
+            # Log progress
+            log_progress('processing', 
+                       f"Processing file {file_counters['processed']}: {item}",
+                       {'file': item, 'progress': f"{file_counters['processed']} files"})
+            
+            # Create temp file with sanitized name
+            sanitized_name = sanitize_filename(item)
+            temp_pdf = tempfile.NamedTemporaryFile(delete=False, suffix='.pdf')
+            temp_pdf_path = temp_pdf.name
+            temp_pdf.close()
+            
+            try:
+                # Download the file
+                with open(temp_pdf_path, 'wb') as local_file:
+                    ftp.retrbinary(f'RETR {item}', local_file.write)
+                
+                # Upload to assistant
+                if upload_file_to_assistant(assistant, temp_pdf_path, item):
+                    file_counters['succeeded'] += 1
+                else:
+                    file_counters['failed'] += 1
+                    
+            except Exception as e:
+                logging.error(f"Error processing {item}: {str(e)}")
+                file_counters['failed'] += 1
+                problematic_files['processing_failed'].append(item)
+                log_progress('error', f"Error processing {item}", {
+                    'file': item,
+                    'error': str(e)
+                }, 'error')
+            finally:
+                # Clean up temp file
+                if os.path.exists(temp_pdf_path):
+                    os.unlink(temp_pdf_path)
+        
+        # Process subdirectories recursively
+        for subdir in subdirs:
+            logging.info(f"📁 Entering subdirectory: {subdir}")
+            try:
+                ftp.cwd(subdir)
+                process_directory(ftp, f"{base_path}/{subdir}", assistant)
+                ftp.cwd('..')  # Go back up
+            except Exception as e:
+                logging.error(f"Error processing subdirectory {subdir}: {e}")
                 
     except Exception as e:
         logging.error(f"Error listing directory: {str(e)}")
@@ -400,8 +474,9 @@ def generate_report():
     logging.info(f"Report generated: {report_file}")
     log_progress('report', "Processing report generated", report['summary'])
     
-    print("\nProcessing Summary:")
-    print("-" * 50)
+    print("\n" + "="*60)
+    print("PROCESSING SUMMARY")
+    print("="*60)
     print(f"Assistant: {ASSISTANT_NAME}")
     print(f"FTP Folder: {FTP_FOLDER}")
     print(f"Total Files: {report['summary']['total_files']}")
@@ -412,6 +487,7 @@ def generate_report():
     print(f"Upload Failed: {report['summary']['upload_failed']}")
     print(f"Processing Failed: {report['summary']['processing_failed']}")
     print(f"Detailed report saved to: {report_file}")
+    print("="*60)
     
     # Send final summary to Supabase
     log_progress('summary', f"FTP to Pinecone process completed for {ASSISTANT_NAME}", {
@@ -508,6 +584,28 @@ def main():
         
         # Navigate to the correct folder path (handles spaces and nested paths)
         navigate_to_ftp_folder(ftp, FTP_FOLDER)
+        
+        # VERIFY PATH - NEW DIAGNOSTIC STEP
+        logging.info("="*60)
+        logging.info("VERIFYING FTP PATH")
+        logging.info("="*60)
+        path_ok, items = verify_ftp_path(ftp, FTP_FOLDER)
+        
+        if not path_ok:
+            error_msg = f"❌ Failed to verify FTP path: {FTP_FOLDER}"
+            logging.error(error_msg)
+            log_progress('error', error_msg, {'path': FTP_FOLDER}, 'error')
+            raise Exception(error_msg)
+        
+        if len(items) == 0:
+            warning_msg = f"⚠️ WARNING: FTP directory is empty or contains no accessible files"
+            logging.warning(warning_msg)
+            log_progress('warning', warning_msg, {
+                'directory': ftp.pwd(),
+                'expected_path': FTP_FOLDER
+            }, 'warning')
+        
+        logging.info("="*60)
         
         # Set total to 0 - will be incremented during processing
         file_counters['total'] = 0
