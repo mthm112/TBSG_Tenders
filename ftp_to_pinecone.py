@@ -58,8 +58,8 @@ class ReusedSslFTP(ftplib.FTP_TLS):
         return conn, size
 
 # Use command line arguments if provided, otherwise fall back to environment variables
-ASSISTANT_NAME = args.assistant_name or os.environ.get('ASSISTANT_NAME', 'heatons-tender-tool')
-FTP_FOLDER = args.folder_path or os.environ.get('FTP_FOLDER', '/Tenders')
+ASSISTANT_NAME = args.assistant_name or os.environ.get('ASSISTANT_NAME', 'tbsg-tender-tool')
+FTP_FOLDER = args.folder_path or os.environ.get('FTP_FOLDER', 'metacog/Tenders/BSG Policies and Procedures')
 
 # Remove leading slash if present (for FTP compatibility)
 if FTP_FOLDER.startswith('/'):
@@ -69,55 +69,40 @@ ASSISTANT_REGION = os.environ.get('ASSISTANT_REGION', 'us')
 
 # Log the configuration
 logging.info(f"Using assistant: {ASSISTANT_NAME}")
-logging.info(f"Using FTP folder: {FTP_FOLDER}")
+logging.info(f"Using FTP folder: {ASSISTANT_NAME}")
 
-# Set assistant instructions based on assistant name
-if ASSISTANT_NAME == 'heatons-tender-tool':
-    ASSISTANT_INSTRUCTIONS = (
-        "You are a corporate RFP assistant. Provide the best possible answer using the data. "
-        "Always reference the file name from the metadata field 'original_filename' and page numbers. "
-        "For example, say 'According to [original_filename], page X...' to clarify your source."
-    )
-elif ASSISTANT_NAME == 'heatons-hr':
-    ASSISTANT_INSTRUCTIONS = (
-        "You are a Heatons HR assistant. Your role is to help Heatons staff "
-        "members find information about HR policies, procedures, benefits, and employee-related matters. "
-        "Provide clear, factual answers based on the uploaded HR documents. "
-        "Always reference the specific HR document you're using by mentioning the file name from "
-        "the metadata field 'original_filename' and page numbers where applicable. "
-        "For example, 'According to [HR Policy document], page X...' "
-        "Be professional, informative, and precise with HR information. If asked about a specific employee "
-        "or sensitive personal information, explain that you cannot provide individual employee details and "
-        "suggest they contact the HR department directly. If you don't know the answer to a question, "
-        "respond with: 'I recommend contacting the HR department directly using hr@heatons.co.uk for any specific details.' "
-        "For general HR policies and procedures, provide comprehensive information from the available documents."
-    )
-elif ASSISTANT_NAME == 'heatons-kb':
-    ASSISTANT_INSTRUCTIONS = (
-        "You are a Heatons internal knowledge base assistant. Your role is to help Heatons staff "
-        "members find information about company operations, processes, and frequently asked questions. "
-        "Provide clear, concise answers using the uploaded documents. "
-        "Always reference the specific document you're using by mentioning the file name from "
-        "the metadata field 'original_filename' and page numbers where applicable. "
-        "For example, 'According to [document name], page X...' "
-        "If you're not sure about an answer, acknowledge this and answer the question with: "
-        "'No relevant articles found, please speak to your Line Manager who can add and amend the knowledge base'"
-    )
-elif ASSISTANT_NAME == 'tbsg-tender-tool':
-    ASSISTANT_INSTRUCTIONS = (
-        "You are a TBSG tender and policy assistant. Provide clear, accurate answers about TBSG policies, "
-        "procedures, certifications, and tender-related information using the uploaded documents. "
-        "Always reference the file name from the metadata field 'original_filename' and page numbers. "
-        "For example, say 'According to [original_filename], page X...' to clarify your source. "
-        "Be professional and precise with policy and procedure information."
-    )
-else:
-    # Default instructions
-    ASSISTANT_INSTRUCTIONS = os.environ.get('ASSISTANT_INSTRUCTIONS', 
-        "You are a Heatons document assistant. Provide the best possible answer using the data. "
-        "Always reference the file name from the metadata field 'original_filename' and page numbers. "
-        "For example, say 'According to [original_filename], page X...' to clarify your source."
-    )
+# TBSG-Specific Assistant Instructions with Barney's feedback incorporated
+ASSISTANT_INSTRUCTIONS = """You are a TBSG tender and policy assistant specialized in creating accurate, professional tender responses for the Business Supplies Group.
+
+CORE REQUIREMENTS:
+1. Language: Use British English spelling and terminology throughout all responses
+2. Accuracy: Provide clear, factual answers using only the uploaded TBSG documents
+3. Citations: Always reference the source document using the 'original_filename' metadata field and specific page numbers
+4. Format: "According to [original_filename], page X..."
+
+RESPONSE GUIDELINES:
+1. Specificity: When asked for "a" or "the" (singular), provide ONLY ONE option, not multiple
+   - Example: "dedicated account manager" = provide ONE person only
+   - Example: "your solution" = describe ONE solution, not multiple options
+
+2. Context Awareness: Only include information relevant to the specific tender/client being answered
+   - Filter out references to other clients unless they are the subject of this tender
+   - Focus responses on the question at hand
+
+3. Word Count: Be professional yet concise
+   - Respect any word/character limits mentioned in questions
+   - Provide comprehensive answers without unnecessary verbosity
+   - Typical tender responses should be 100-300 words unless otherwise specified
+
+4. Professionalism: Maintain professional, confident tone appropriate for B2B tender submissions
+   - Use industry-standard terminology
+   - Be direct and specific
+   - Avoid hedging language unless genuinely uncertain
+
+5. Client-Specific Details: When context about the specific client/tender is provided, prioritize that information in your response
+
+If you cannot find relevant information in the documents to answer a question accurately, state: "This information is not available in the current documentation. Please consult with the relevant TBSG department for accurate details."
+"""
 
 # Validate required environment variables
 required_vars = {
@@ -167,7 +152,7 @@ def send_log_to_supabase(log_type, message, details=None):
         # Add workflow URL to details if available
         github_run_id = os.environ.get('GITHUB_RUN_ID')
         if github_run_id and 'workflow_url' not in log_data['details']:
-            github_repo = os.environ.get('GITHUB_REPOSITORY', 'mthm112/heatonspinecone')
+            github_repo = os.environ.get('GITHUB_REPOSITORY', 'mthm112/TBSG_Tenders')
             log_data['details']['workflow_url'] = f"https://github.com/{github_repo}/actions/runs/{github_run_id}"
         
         # Add assistant information to details
@@ -183,537 +168,219 @@ def send_log_to_supabase(log_type, message, details=None):
         response = requests.post(
             f"{SUPABASE_URL}/rest/v1/workflow_logs",
             headers=headers,
-            json=log_data
+            json=log_data,
+            timeout=10
         )
         
-        if response.status_code not in (200, 201):
-            logging.warning(f"Failed to send log to Supabase: {response.status_code} {response.text}")
+        if response.status_code not in [200, 201]:
+            logging.warning(f"Failed to send log to Supabase: {response.status_code} - {response.text}")
             return False
-        
+            
         return True
+        
+    except requests.exceptions.Timeout:
+        logging.warning("Timeout sending log to Supabase")
+        return False
     except Exception as e:
-        logging.warning(f"Exception sending log to Supabase: {str(e)}")
+        logging.warning(f"Error sending log to Supabase: {str(e)}")
         return False
 
 def log_progress(stage, message, details=None, log_type='info'):
-    """Log progress updates at key points with standardized formatting."""
-    combined_details = {
-        'stage': stage,
-        'progress': details.get('progress', {}) if details else {},
-        'assistant_name': ASSISTANT_NAME,
-        'ftp_folder': FTP_FOLDER
-    }
+    """Helper function to log both locally and to Supabase."""
+    # Log locally
+    log_func = getattr(logging, log_type.lower(), logging.info)
+    log_func(f"[{stage.upper()}] {message}")
     
-    # Add any additional details
-    if details:
-        for key, value in details.items():
-            if key != 'progress':
-                combined_details[key] = value
-                
-    send_log_to_supabase(log_type, message, combined_details)
-    logging.info(f"[{stage}] {message}")
+    # Log to Supabase
+    send_log_to_supabase(log_type, message, details)
 
-def get_file_metadata(file_name, current_path):
-    """Extract metadata from filename and path based on assistant type."""
+def extract_text_from_pdf(pdf_path):
+    """Extract text from PDF using PyPDF2 with OCR fallback for scanned documents."""
     try:
-        # Extract date pattern if present
-        date_match = None
-        for pattern in [r'\d{4}-\d{2}-\d{2}', r'\d{4}-\d{2}', r'\d{4}']:
-            date_match = re.search(pattern, file_name)
-            if date_match:
-                break
-
-        # Base metadata common to all assistants
-        metadata = {
-            "filename": file_name,
-            "original_filename": file_name,  # So the assistant can reference it
-            "upload_date": datetime.now().strftime("%Y-%m-%d"),
-            "path": current_path,
-            "document_date": date_match.group(0) if date_match else None,
-            "version": "current",
-            "run_id": RUN_ID
-        }
-        
-        # Assistant-specific metadata
-        if ASSISTANT_NAME == 'heatons-tender-tool':
-            # Determine document type and category based on filename keywords for tenders
-            doc_type = "general"
-            category = "general"
+        with open(pdf_path, 'rb') as file:
+            reader = PyPDF2.PdfReader(file)
             
-            if any(term in file_name for term in ["ISO", "Certificate", "Cert"]):
-                doc_type = "certification"
-                category = "compliance"
-            elif "Policy" in file_name:
-                doc_type = "policy"
-                category = "governance"
-            elif "Risk Assessment" in file_name:
-                doc_type = "risk_assessment"
-                category = "health_and_safety"
-            elif "Method Statement" in file_name:
-                doc_type = "method_statement"
-                category = "procedures"
-            elif "Account" in file_name:
-                doc_type = "financial"
-                category = "finance"
-            elif any(term in file_name for term in ["GDPR", "Data Protection"]):
-                doc_type = "compliance"
-                category = "data_protection"
-            elif "H&S" in file_name or "Health and Safety" in file_name:
-                doc_type = "health_and_safety"
-                category = "health_and_safety"
+            # Check if PDF is encrypted
+            if reader.is_encrypted:
+                logging.warning(f"PDF is password protected: {pdf_path}")
+                problematic_files['password_protected'].append(pdf_path)
+                return None
+            
+            text = ""
+            total_pages = len(reader.pages)
+            
+            # Try extracting text normally first
+            for page_num, page in enumerate(reader.pages, 1):
+                page_text = page.extract_text()
+                if page_text:
+                    text += page_text + "\n"
+            
+            # If we got substantial text, return it
+            if len(text.strip()) > 100:  # Arbitrary threshold
+                return text
+            
+            # If text extraction yielded little/no text, try OCR
+            logging.info(f"PDF appears to be scanned/image-based. Attempting OCR: {pdf_path}")
+            problematic_files['ocr_needed'].append(pdf_path)
+            
+            try:
+                # Convert PDF to images
+                images = convert_from_path(pdf_path)
+                ocr_text = ""
                 
-            metadata["document_type"] = doc_type
-            metadata["category"] = category
-            
-        elif ASSISTANT_NAME == 'heatons-hr':
-            # HR-specific categorization
-            doc_type = "general"
-            category = "hr"
-            
-            if any(term in file_name for term in ["Policy", "Policies"]):
-                doc_type = "policy"
-                category = "hr_policies"
-            elif "Handbook" in file_name:
-                doc_type = "handbook"
-                category = "employee_handbook"
-            elif any(term in file_name for term in ["Benefit", "Benefits", "Insurance", "Pension"]):
-                doc_type = "benefits"
-                category = "employee_benefits"
-            elif any(term in file_name for term in ["Leave", "Holiday", "Vacation", "Absence"]):
-                doc_type = "leave"
-                category = "time_off"
-            elif any(term in file_name for term in ["Pay", "Salary", "Compensation", "Bonus"]):
-                doc_type = "compensation"
-                category = "payroll"
-            elif any(term in file_name for term in ["Training", "Development", "Learning"]):
-                doc_type = "training"
-                category = "employee_development"
-            elif any(term in file_name for term in ["Form", "Template"]):
-                doc_type = "form"
-                category = "hr_forms"
+                for i, image in enumerate(images, 1):
+                    logging.info(f"  OCR processing page {i}/{len(images)}...")
+                    page_text = pytesseract.image_to_string(image)
+                    ocr_text += page_text + "\n"
                 
-            metadata["document_type"] = doc_type
-            metadata["category"] = category
-            metadata["hr_section"] = current_path.split('/')[-1] if '/' in current_path else "general"
-            
-        elif ASSISTANT_NAME == 'heatons-kb':
-            # Knowledge Base-specific categorization
-            doc_type = "general"
-            category = "general"
-            
-            if "FAQ" in file_name or "Frequently Asked" in file_name:
-                doc_type = "faq"
-                category = "knowledge_base"
-            elif "Process" in file_name or "Procedure" in file_name:
-                doc_type = "process"
-                category = "operations"
-            elif "Training" in file_name:
-                doc_type = "training"
-                category = "education"
-            elif "Guide" in file_name or "Manual" in file_name or "Instructions" in file_name:
-                doc_type = "guide"
-                category = "instructions"
-            elif "Policy" in file_name:
-                doc_type = "policy"
-                category = "governance"
+                if len(ocr_text.strip()) > 50:
+                    return ocr_text
+                else:
+                    logging.warning(f"OCR yielded little text for: {pdf_path}")
+                    return None
+                    
+            except Exception as ocr_error:
+                logging.error(f"OCR failed for {pdf_path}: {str(ocr_error)}")
+                return None
                 
-            metadata["document_type"] = doc_type
-            metadata["category"] = category
-            metadata["kb_section"] = current_path.split('/')[-1] if '/' in current_path else "general"
-
-        return metadata
     except Exception as e:
-        logging.warning(f"Error extracting metadata for {file_name}: {str(e)}")
-        return {
-            "filename": file_name,
-            "original_filename": file_name,
-            "upload_date": datetime.now().strftime("%Y-%m-%d"),
-            "path": current_path,
-            "document_type": "unknown",
-            "category": "general",
-            "run_id": RUN_ID
-        }
-
-def perform_ocr(pdf_path):
-    """Perform OCR on a PDF and return its text content."""
-    try:
-        images = convert_from_path(pdf_path)
-        text_content = []
-        for image in images:
-            text = pytesseract.image_to_string(image)
-            text_content.append(text)
-        return '\n'.join(text_content)
-    except Exception as e:
-        logging.error(f"OCR processing failed: {str(e)}")
+        logging.error(f"Error extracting text from PDF {pdf_path}: {str(e)}")
+        problematic_files['processing_failed'].append(pdf_path)
         return None
 
-def create_searchable_pdf(pdf_path, output_path):
-    """Create a searchable PDF by applying OCR and adding a text layer."""
-    try:
-        images = convert_from_path(pdf_path)
-        pdf_writer = PyPDF2.PdfWriter()
-        for image in images:
-            # Convert image to PDF page
-            with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp_file:
-                image.save(tmp_file.name, 'PDF')
-                page = PyPDF2.PdfReader(tmp_file.name).pages[0]
-                pdf_writer.add_page(page)
-                os.unlink(tmp_file.name)
-        with open(output_path, 'wb') as output_file:
-            pdf_writer.write(output_file)
-        return True
-    except Exception as e:
-        logging.error(f"Failed to create searchable PDF: {str(e)}")
-        return False
-
-def verify_pdf(file_path):
-    """Verify whether a PDF is valid and extractable."""
-    try:
-        with open(file_path, 'rb') as file:
-            pdf = PyPDF2.PdfReader(file)
-            if pdf.is_encrypted:
-                return False, "PDF is password protected"
-            try:
-                text = pdf.pages[0].extract_text()
-                if not text or not text.strip():
-                    return False, "PDF contains no extractable text (needs OCR)"
-            except Exception:
-                return False, "Failed to extract text (PDF might be corrupted)"
-            return True, "PDF is valid and contains extractable text"
-    except Exception as e:
-        return False, f"PDF verification failed: {str(e)}"
-
-def process_file(file_path, file_name, current_path, assistant):
-    """Process a single file: verify (and optionally OCR) then upload with metadata."""
-    max_retries = 3
-    retry_delay = 5
-
-    try:
-        file_counters['processed'] += 1
-        progress_msg = f"Processing file {file_counters['processed']}/{file_counters['total']}: {file_name}"
-        logging.info(progress_msg)
-        
-        # Less verbose logs for individual files to avoid UI clutter
-        if file_counters['processed'] % 5 == 0 or file_counters['processed'] == 1 or file_counters['processed'] == file_counters['total']:
-            log_progress('processing', f"Processing files: {file_counters['processed']}/{file_counters['total']}", {
-                'progress': {
-                    'current': file_counters['processed'],
-                    'total': file_counters['total'],
-                    'succeeded': file_counters['succeeded'],
-                    'failed': file_counters['failed'],
-                    'current_file': file_name
-                }
-            })
-        
-        # If this is a PDF, verify whether it needs OCR or is password protected.
-        if file_path.lower().endswith('.pdf'):
-            is_valid, message = verify_pdf(file_path)
-            if not is_valid:
-                if "needs OCR" in message:
-                    ocr_msg = f"OCR required for {file_name}. Attempting OCR processing."
-                    logging.info(ocr_msg)
-                    
-                    # Create a searchable PDF via OCR
-                    with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as ocr_file:
-                        ocr_success = create_searchable_pdf(file_path, ocr_file.name)
-                        if ocr_success:
-                            file_path = ocr_file.name
-                            ocr_success_msg = f"Searchable PDF created for {file_name}"
-                            logging.info(ocr_success_msg)
-                            log_progress('ocr', f"OCR processing completed for {file_name}", {
-                                'file': file_name
-                            })
-                        else:
-                            problematic_files['ocr_needed'].append({
-                                'file': f"{current_path}/{file_name}",
-                                'reason': "OCR processing failed"
-                            })
-                            ocr_fail_msg = f"OCR processing failed for {file_name}"
-                            logging.error(ocr_fail_msg)
-                            log_progress('ocr', ocr_fail_msg, {
-                                'file': file_name
-                            }, 'error')
-                            file_counters['failed'] += 1
-                            return False
-                elif "password protected" in message:
-                    problematic_files['password_protected'].append({
-                        'file': f"{current_path}/{file_name}",
-                        'reason': message
-                    })
-                    password_msg = f"Password protected PDF: {file_name}"
-                    logging.warning(password_msg)
-                    log_progress('password', password_msg, {
-                        'file': file_name
-                    }, 'warning')
-                    file_counters['failed'] += 1
-                    return False
-
-        # Prepare metadata with assistant-specific categorization
-        metadata = get_file_metadata(file_name, current_path)
-        
-        # Rename the local file to preserve the real name in Pinecone Assistant
-        final_upload_path = os.path.join(tempfile.gettempdir(), file_name)
-        if os.path.exists(final_upload_path):
-            os.remove(final_upload_path)
-        shutil.move(file_path, final_upload_path)
-
-        # Attempt upload with retries
-        for attempt in range(max_retries):
-            try:
-                # Upload the file
-                assistant.upload_file(
-                    file_path=final_upload_path,
-                    metadata=metadata,
-                    timeout=30
-                )
-                success_msg = f"Uploaded '{file_name}' successfully with metadata."
-                logging.info(success_msg)
-                file_counters['succeeded'] += 1
-                time.sleep(2)
-                break
-            except Exception as e:
-                if attempt == max_retries - 1:
-                    problematic_files['upload_failed'].append({
-                        'file': f"{current_path}/{file_name}",
-                        'reason': str(e)
-                    })
-                    error_msg = f"Upload failed for '{file_name}' after {max_retries} attempts: {str(e)}"
-                    logging.error(error_msg)
-                    log_progress('upload', error_msg, {
-                        'file': file_name
-                    }, 'error')
-                    file_counters['failed'] += 1
-                else:
-                    retry_msg = f"Upload attempt {attempt+1} failed for '{file_name}': {str(e)}. Retrying..."
-                    logging.warning(retry_msg)
-                time.sleep(retry_delay)
-
-        # Clean up the renamed file
-        if os.path.exists(final_upload_path):
-            os.remove(final_upload_path)
-
-        return True
-
-    except Exception as e:
-        problematic_files['processing_failed'].append({
-            'file': f"{current_path}/{file_name}",
-            'reason': str(e)
-        })
-        process_error_msg = f"Error processing {file_name}: {str(e)}"
-        logging.error(process_error_msg)
-        log_progress('error', process_error_msg, {
-            'file': file_name
-        }, 'error')
-        file_counters['failed'] += 1
-        return False
+def sanitize_filename(filename):
+    """Remove or replace characters that might cause issues."""
+    # Replace problematic characters
+    filename = filename.replace(' ', '_')
+    filename = re.sub(r'[^\w\-.]', '', filename)
+    return filename
 
 def navigate_to_ftp_folder(ftp, folder_path):
-    """Navigate to FTP folder step-by-step to handle paths with spaces."""
+    """Navigate to FTP folder handling spaces in path names."""
     try:
-        # Start from root
-        ftp.cwd('/')
-        
-        # Split path into parts
-        parts = [p for p in folder_path.split('/') if p]
-        
-        logging.info(f"Navigating to {folder_path} in {len(parts)} steps...")
-        
-        # Navigate step by step
-        current = '/'
+        # Split the path and navigate through each part
+        parts = folder_path.split('/')
         for part in parts:
-            try:
-                ftp.cwd(part)
-                current = f"{current}{part}/"
-                logging.info(f"  ✓ Navigated to: {current}")
-            except ftplib.error_perm as e:
-                logging.error(f"  ✗ Failed to navigate to '{part}': {str(e)}")
-                raise Exception(f"Cannot access folder '{part}' in path '{folder_path}'")
-        
-        logging.info(f"Successfully navigated to {folder_path}")
-        return True
-        
+            if part:  # Skip empty parts
+                try:
+                    ftp.cwd(part)
+                    logging.info(f"Navigated to: {part}")
+                except Exception as e:
+                    logging.error(f"Failed to navigate to '{part}': {str(e)}")
+                    raise
     except Exception as e:
-        logging.error(f"Failed to navigate to {folder_path}: {str(e)}")
+        logging.error(f"Failed to navigate to folder {folder_path}: {str(e)}")
         raise
 
-def scan_directory(ftp, current_path):
-    """Scan directory to count files (for progress tracking)."""
-    file_count = 0
-    directories = []
+def upload_file_to_assistant(assistant, file_path, original_filename):
+    """Upload a file to Pinecone assistant with retry logic."""
+    max_retries = 3
+    retry_delay = 5
     
-    try:
-        def process_line(line):
-            nonlocal file_count
-            parts = line.split(None, 8)
-            if len(parts) >= 9:
-                name = parts[8]
-                if line.startswith('d'):
-                    directories.append(name)
-                elif any(name.lower().endswith(ext) for ext in 
-                        ('.pdf', '.doc', '.docx', '.txt', '.jpg', '.png', '.xlsx')):
-                    file_count += 1
-        
-        ftp.retrlines('LIST', process_line)
-        
-        # Scan subdirectories recursively (skip . and .. to avoid infinite loops)
-        for dir_name in directories:
-            # CRITICAL: Skip current (.) and parent (..) directories
-            if dir_name in ['.', '..']:
-                continue
-                
-            try:
-                original_dir = ftp.pwd()
-                ftp.cwd(dir_name)
-                sub_count = scan_directory(ftp, f"{current_path}/{dir_name}")
-                file_count += sub_count
-                ftp.cwd(original_dir)
-                if sub_count > 0:
-                    log_progress('scan', f"Found {sub_count} files in subdirectory {dir_name}")
-            except Exception as e:
-                logging.error(f"Failed to scan subdirectory {dir_name}: {str(e)}")
-    except Exception as e:
-        logging.error(f"Error scanning directory {current_path}: {str(e)}")
+    for attempt in range(max_retries):
+        try:
+            with open(file_path, "rb") as f:
+                upload_response = assistant.upload_file(
+                    file_name=original_filename,
+                    file_data=f,
+                    timeout=120
+                )
+            
+            logging.info(f"✓ Successfully uploaded: {original_filename}")
+            log_progress('upload', f"Successfully uploaded: {original_filename}", {
+                'file': original_filename,
+                'attempt': attempt + 1
+            }, 'success')
+            return True
+            
+        except Exception as e:
+            if attempt < max_retries - 1:
+                logging.warning(f"Upload attempt {attempt + 1} failed for {original_filename}, retrying in {retry_delay}s...")
+                time.sleep(retry_delay)
+            else:
+                logging.error(f"✗ Failed to upload {original_filename} after {max_retries} attempts: {str(e)}")
+                problematic_files['upload_failed'].append(original_filename)
+                log_progress('upload', f"Failed to upload: {original_filename}", {
+                    'file': original_filename,
+                    'error': str(e),
+                    'attempts': max_retries
+                }, 'error')
+                return False
     
-    return file_count
+    return False
 
-def process_directory(ftp, current_path, assistant):
-    """Recursively process files in the given FTP directory and its subdirectories."""
+def process_directory(ftp, base_path, assistant):
+    """Process all PDF files in the directory."""
     try:
-        logging.info(f"Processing directory: {current_path}")
-        log_progress('directory', f"Processing directory: {current_path}")
+        items = ftp.nlst()
         
-        files = []
-        directories = []
-        
-        def process_line(line):
-            parts = line.split(None, 8)
-            if len(parts) >= 9:
-                name = parts[8]
-                if line.startswith('d'):
-                    directories.append(name)
-                elif any(name.lower().endswith(ext) for ext in 
-                        ('.pdf', '.doc', '.docx', '.txt', '.jpg', '.png', '.xlsx', '.jpeg')):
-                    files.append(name)
-        
-        ftp.retrlines('LIST', process_line)
-        
-        if len(files) > 0:
-            # Increment total counter as we discover files (no pre-scan needed)
-            file_counters['total'] += len(files)
-            log_progress('directory', f"Found {len(files)} files in {current_path} (total so far: {file_counters['total']})")
-        
-        # Process files in the current directory
-        for file_name in files:
+        for item in items:
             try:
-                # Create temp file with proper extension
-                file_extension = os.path.splitext(file_name)[1]
-                with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension) as temp_file:
-                    temp_path = temp_file.name
-                
+                # Try to CWD into it - if it works, it's a directory
+                current_dir = ftp.pwd()
                 try:
-                    # CRITICAL FIX: Don't use quotes around filename
-                    # FTP_TLS handles this differently than regular FTP
-                    logging.info(f"Downloading: {current_path}/{file_name}")
-                    
-                    # Download file in binary mode
-                    with open(temp_path, 'wb') as f:
-                        ftp.retrbinary(f'RETR {file_name}', f.write)
-                    
-                    logging.info(f"Downloaded: {current_path}/{file_name}")
-                    
-                    # Process the downloaded file
-                    process_file(temp_path, file_name, current_path, assistant)
-                    
-                except ftplib.error_perm as e:
-                    error_code = str(e)
-                    if '550' in error_code:
-                        # Try alternative retrieval method
-                        logging.warning(f"Retrying download for {file_name} using alternative method")
+                    ftp.cwd(item)
+                    # It's a directory, process it recursively
+                    logging.info(f"Entering subdirectory: {item}")
+                    process_directory(ftp, f"{base_path}/{item}", assistant)
+                    ftp.cwd('..')  # Go back up
+                except ftplib.error_perm:
+                    # It's a file, not a directory
+                    if item.lower().endswith('.pdf'):
+                        file_counters['total'] += 1
+                        file_counters['processed'] += 1
+                        
+                        # Log progress
+                        log_progress('processing', 
+                                   f"Processing file {file_counters['processed']}: {item}",
+                                   {'file': item, 'progress': f"{file_counters['processed']} files"})
+                        
+                        # Create temp file with sanitized name
+                        sanitized_name = sanitize_filename(item)
+                        temp_pdf = tempfile.NamedTemporaryFile(delete=False, suffix='.pdf')
+                        temp_pdf_path = temp_pdf.name
+                        temp_pdf.close()
+                        
                         try:
-                            # Some FTP servers need the full path
-                            ftp.retrbinary(f'RETR ./{file_name}', open(temp_path, 'wb').write)
-                            logging.info(f"Downloaded on retry: {current_path}/{file_name}")
-                            process_file(temp_path, file_name, current_path, assistant)
-                        except Exception as retry_error:
-                            raise Exception(f"Failed after retry: {retry_error}")
+                            # Download the file
+                            with open(temp_pdf_path, 'wb') as local_file:
+                                ftp.retrbinary(f'RETR {item}', local_file.write)
+                            
+                            # Upload to assistant
+                            if upload_file_to_assistant(assistant, temp_pdf_path, item):
+                                file_counters['succeeded'] += 1
+                            else:
+                                file_counters['failed'] += 1
+                                
+                        except Exception as e:
+                            logging.error(f"Error processing {item}: {str(e)}")
+                            file_counters['failed'] += 1
+                            problematic_files['processing_failed'].append(item)
+                            log_progress('error', f"Error processing {item}", {
+                                'file': item,
+                                'error': str(e)
+                            }, 'error')
+                        finally:
+                            # Clean up temp file
+                            if os.path.exists(temp_pdf_path):
+                                os.unlink(temp_pdf_path)
                     else:
-                        raise
-                
-                finally:
-                    # Always clean up temp file
-                    if os.path.exists(temp_path):
-                        os.remove(temp_path)
-
+                        logging.debug(f"Skipping non-PDF file: {item}")
+                        
             except Exception as e:
-                file_error_msg = f"Failed to process file {file_name}: {str(e)}"
-                logging.error(file_error_msg)
-                log_progress('error', file_error_msg, {
-                    'file': file_name, 
-                    'path': current_path
-                }, 'error')
-                problematic_files['processing_failed'].append({
-                    'file': f"{current_path}/{file_name}",
-                    'reason': str(e)
-                })
-                file_counters['failed'] += 1
+                logging.error(f"Error processing item {item}: {str(e)}")
                 
-            # Update progress (works even if total is still being discovered)
-            if file_counters['processed'] % 5 == 0:
-                total_msg = f"{file_counters['total']}+" if file_counters['processed'] < file_counters['total'] else str(file_counters['total'])
-                log_progress('progress', f"Processed {file_counters['processed']}/{total_msg} files", {
-                    'progress': {
-                        'current': file_counters['processed'],
-                        'total': file_counters['total'],
-                        'succeeded': file_counters['succeeded'],
-                        'failed': file_counters['failed']
-                    }
-                })
-        
-        # Process subdirectories recursively (skip . and .. to avoid infinite loops)
-        for dir_name in directories:
-            # CRITICAL: Skip current (.) and parent (..) directories
-            if dir_name in ['.', '..']:
-                continue
-                
-            try:
-                original_dir = ftp.pwd()
-                logging.info(f"Entering subdirectory: {current_path}/{dir_name}")
-                
-                # Change to subdirectory
-                ftp.cwd(dir_name)
-                
-                # Process subdirectory
-                process_directory(ftp, f"{current_path}/{dir_name}", assistant)
-                
-                # Return to parent directory
-                ftp.cwd(original_dir)
-                
-            except Exception as e:
-                dir_error_msg = f"Failed to process subdirectory {dir_name}: {str(e)}"
-                logging.error(dir_error_msg)
-                log_progress('error', dir_error_msg, {
-                    'directory': dir_name, 
-                    'path': current_path
-                }, 'error')
-                try:
-                    ftp.cwd(original_dir)
-                except:
-                    pass
-
     except Exception as e:
-        process_dir_error = f"Error processing directory {current_path}: {str(e)}"
-        logging.error(process_dir_error)
-        log_progress('error', process_dir_error, {
-            'path': current_path
-        }, 'error')
+        logging.error(f"Error listing directory: {str(e)}")
+        raise
 
 def generate_report():
-    """Generate and save a report on problematic files."""
+    """Generate a detailed report of the processing."""
     report = {
         'run_id': RUN_ID,
         'assistant_name': ASSISTANT_NAME,
         'ftp_folder': FTP_FOLDER,
-        'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        'timestamp': datetime.now().isoformat(),
         'summary': {
             'total_files': file_counters['processed'],
             'successful_uploads': file_counters['succeeded'],
@@ -774,7 +441,7 @@ def reset_assistant(pc):
             logging.warning(deletion_msg)
             log_progress('assistant', deletion_msg, {}, 'warning')
             
-        # Create the assistant - REMOVED the model parameter
+        # Create the assistant with enhanced TBSG instructions
         logging.info(f"Creating new assistant: {ASSISTANT_NAME}")
         log_progress('assistant', f"Creating new assistant: {ASSISTANT_NAME}")
         assistant = pc.assistant.create_assistant(
@@ -783,10 +450,11 @@ def reset_assistant(pc):
             region=ASSISTANT_REGION,
             timeout=30
         )
-        logging.info("Assistant created successfully.")
+        logging.info("Assistant created successfully with enhanced TBSG prompt.")
         log_progress('assistant', "Assistant created successfully", {
             'assistant_name': ASSISTANT_NAME,
-            'region': ASSISTANT_REGION
+            'region': ASSISTANT_REGION,
+            'prompt_version': 'v2_barney_feedback'
         }, 'success')
         return assistant
         
