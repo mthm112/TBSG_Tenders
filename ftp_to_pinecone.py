@@ -69,7 +69,7 @@ ASSISTANT_REGION = os.environ.get('ASSISTANT_REGION', 'us')
 
 # Log the configuration
 logging.info(f"Using assistant: {ASSISTANT_NAME}")
-logging.info(f"Using FTP folder: {FTP_FOLDER}")  # FIXED: Was logging ASSISTANT_NAME
+logging.info(f"Using FTP folder: {FTP_FOLDER}")
 
 # TBSG-Specific Assistant Instructions with Barney's feedback incorporated
 ASSISTANT_INSTRUCTIONS = """You are a TBSG tender and policy assistant specialized in creating accurate, professional tender responses for the Business Supplies Group.
@@ -131,7 +131,7 @@ file_counters = {
     'processed': 0,
     'succeeded': 0,
     'failed': 0,
-    'total': 0  # Will be updated as we discover files
+    'total': 0
 }
 
 def send_log_to_supabase(log_type, message, details=None):
@@ -187,70 +187,12 @@ def send_log_to_supabase(log_type, message, details=None):
 
 def log_progress(stage, message, details=None, log_type='info'):
     """Helper function to log both locally and to Supabase."""
-    # Log locally
     log_func = getattr(logging, log_type.lower(), logging.info)
     log_func(f"[{stage.upper()}] {message}")
-    
-    # Log to Supabase
     send_log_to_supabase(log_type, message, details)
-
-def extract_text_from_pdf(pdf_path):
-    """Extract text from PDF using PyPDF2 with OCR fallback for scanned documents."""
-    try:
-        with open(pdf_path, 'rb') as file:
-            reader = PyPDF2.PdfReader(file)
-            
-            # Check if PDF is encrypted
-            if reader.is_encrypted:
-                logging.warning(f"PDF is password protected: {pdf_path}")
-                problematic_files['password_protected'].append(pdf_path)
-                return None
-            
-            text = ""
-            total_pages = len(reader.pages)
-            
-            # Try extracting text normally first
-            for page_num, page in enumerate(reader.pages, 1):
-                page_text = page.extract_text()
-                if page_text:
-                    text += page_text + "\n"
-            
-            # If we got substantial text, return it
-            if len(text.strip()) > 100:  # Arbitrary threshold
-                return text
-            
-            # If text extraction yielded little/no text, try OCR
-            logging.info(f"PDF appears to be scanned/image-based. Attempting OCR: {pdf_path}")
-            problematic_files['ocr_needed'].append(pdf_path)
-            
-            try:
-                # Convert PDF to images
-                images = convert_from_path(pdf_path)
-                ocr_text = ""
-                
-                for i, image in enumerate(images, 1):
-                    logging.info(f"  OCR processing page {i}/{len(images)}...")
-                    page_text = pytesseract.image_to_string(image)
-                    ocr_text += page_text + "\n"
-                
-                if len(ocr_text.strip()) > 50:
-                    return ocr_text
-                else:
-                    logging.warning(f"OCR yielded little text for: {pdf_path}")
-                    return None
-                    
-            except Exception as ocr_error:
-                logging.error(f"OCR failed for {pdf_path}: {str(ocr_error)}")
-                return None
-                
-    except Exception as e:
-        logging.error(f"Error extracting text from PDF {pdf_path}: {str(e)}")
-        problematic_files['processing_failed'].append(pdf_path)
-        return None
 
 def sanitize_filename(filename):
     """Remove or replace characters that might cause issues."""
-    # Replace problematic characters
     filename = filename.replace(' ', '_')
     filename = re.sub(r'[^\w\-.]', '', filename)
     return filename
@@ -258,10 +200,9 @@ def sanitize_filename(filename):
 def navigate_to_ftp_folder(ftp, folder_path):
     """Navigate to FTP folder handling spaces in path names."""
     try:
-        # Split the path and navigate through each part
         parts = folder_path.split('/')
         for part in parts:
-            if part:  # Skip empty parts
+            if part:
                 try:
                     ftp.cwd(part)
                     logging.info(f"Navigated to: {part}")
@@ -272,32 +213,72 @@ def navigate_to_ftp_folder(ftp, folder_path):
         logging.error(f"Failed to navigate to folder {folder_path}: {str(e)}")
         raise
 
+def parse_ftp_list_line(line):
+    """
+    Parse a line from FTP LIST command to extract filename and type.
+    Returns: (filename, is_directory)
+    """
+    # Typical format: drwxrwxrwx   1 user     group           0 Dec  2 16:04 Policies
+    parts = line.split()
+    if len(parts) < 9:
+        return None, False
+    
+    # First character indicates type: 'd' for directory, '-' for file
+    is_directory = parts[0].startswith('d')
+    
+    # Filename is everything after the date/time (last parts)
+    # Join from index 8 onwards to handle filenames with spaces
+    filename = ' '.join(parts[8:])
+    
+    # Skip . and ..
+    if filename in ['.', '..']:
+        return None, False
+    
+    return filename, is_directory
+
+def get_directory_contents(ftp):
+    """
+    Get directory contents using LIST command and parse it properly.
+    Returns: (files, directories)
+    """
+    lines = []
+    ftp.retrlines('LIST', lines.append)
+    
+    files = []
+    directories = []
+    
+    for line in lines:
+        filename, is_dir = parse_ftp_list_line(line)
+        if filename:
+            if is_dir:
+                directories.append(filename)
+            else:
+                files.append(filename)
+    
+    return files, directories
+
 def verify_ftp_path(ftp, expected_path):
-    """
-    Verify we can access the FTP path and list its contents
-    """
+    """Verify we can access the FTP path and list its contents"""
     try:
         current = ftp.pwd()
         logging.info(f"📍 Current FTP directory: {current}")
         
-        # Try to list contents using NLST
-        items = ftp.nlst()
-        logging.info(f"✓ Directory listing successful: {len(items)} items found")
+        # Use our improved directory listing
+        files, directories = get_directory_contents(ftp)
+        total_items = len(files) + len(directories)
         
-        # Try using LIST instead of NLST for more details
-        try:
-            detailed = []
-            ftp.retrlines('LIST', detailed.append)
-            logging.info(f"📋 Detailed listing (first 5 items):")
-            for line in detailed[:5]:
-                logging.info(f"  {line}")
-        except Exception as e:
-            logging.warning(f"Could not get detailed listing: {e}")
+        logging.info(f"✓ Directory listing successful: {len(files)} files, {len(directories)} directories")
         
-        return True, items
+        # Show sample of what's there
+        if files:
+            logging.info(f"📄 Sample files: {files[:5]}")
+        if directories:
+            logging.info(f"📁 Subdirectories: {directories}")
+        
+        return True, files, directories
     except Exception as e:
         logging.error(f"❌ Failed to verify FTP path: {e}")
-        return False, []
+        return False, [], []
 
 def upload_file_to_assistant(assistant, file_path, original_filename):
     """Upload a file to Pinecone assistant with retry logic."""
@@ -339,73 +320,44 @@ def upload_file_to_assistant(assistant, file_path, original_filename):
 def process_directory(ftp, base_path, assistant):
     """Process all PDF files in the directory with comprehensive diagnostics."""
     try:
-        # Get current location
         current_dir = ftp.pwd()
         logging.info(f"📁 Processing directory: {current_dir}")
         
-        # Get all items
-        items = ftp.nlst()
-        logging.info(f"📊 Found {len(items)} total items")
+        # Get directory contents using improved method
+        files, directories = get_directory_contents(ftp)
         
-        # Check if empty
-        if not items:
-            error_msg = f"❌ EMPTY DIRECTORY: No files found in {current_dir}"
-            logging.error(error_msg)
-            log_progress('error', error_msg, {
-                'directory': current_dir,
-                'expected_path': base_path
-            }, 'error')
-            return
+        logging.info(f"📊 Found {len(files)} files and {len(directories)} subdirectories")
         
-        # Categorize items
-        pdf_files = []
-        subdirs = []
-        other_files = []
-        
-        for item in items:
-            try:
-                # Check if it's a directory
-                current_pwd = ftp.pwd()
-                try:
-                    ftp.cwd(item)
-                    subdirs.append(item)
-                    ftp.cwd(current_pwd)  # Go back to original directory
-                except ftplib.error_perm:
-                    # It's a file
-                    if item.lower().endswith('.pdf'):
-                        pdf_files.append(item)
-                    else:
-                        other_files.append(item)
-            except Exception as e:
-                logging.warning(f"Could not categorize {item}: {e}")
+        # Categorize files
+        pdf_files = [f for f in files if f.lower().endswith('.pdf')]
+        other_files = [f for f in files if not f.lower().endswith('.pdf')]
         
         # Log summary
         logging.info(f"📊 Directory Summary for {current_dir}:")
         logging.info(f"  - PDF Files: {len(pdf_files)}")
-        logging.info(f"  - Subdirectories: {len(subdirs)}")
         logging.info(f"  - Other Files: {len(other_files)}")
+        logging.info(f"  - Subdirectories: {len(directories)}")
         
         if pdf_files:
-            logging.info(f"📄 PDF Files to process: {pdf_files}")
+            logging.info(f"📄 PDF Files to process: {pdf_files[:10]}")  # Show first 10
         else:
-            logging.warning(f"⚠️ NO PDF FILES FOUND in {current_dir}!")
-            if other_files:
-                logging.info(f"  Other files present: {other_files[:5]}")
-            if subdirs:
-                logging.info(f"  Subdirectories found: {subdirs}")
+            logging.info(f"⚠️ No PDF files in this directory")
         
-        # Process PDFs
-        for item in pdf_files:
+        if other_files:
+            logging.info(f"  Other files: {other_files[:5]}")
+        
+        if directories:
+            logging.info(f"  Subdirectories: {directories}")
+        
+        # Process PDF files in current directory
+        for pdf_file in pdf_files:
             file_counters['total'] += 1
             file_counters['processed'] += 1
             
-            # Log progress
             log_progress('processing', 
-                       f"Processing file {file_counters['processed']}: {item}",
-                       {'file': item, 'progress': f"{file_counters['processed']} files"})
+                       f"Processing file {file_counters['processed']}: {pdf_file}",
+                       {'file': pdf_file, 'directory': current_dir})
             
-            # Create temp file with sanitized name
-            sanitized_name = sanitize_filename(item)
             temp_pdf = tempfile.NamedTemporaryFile(delete=False, suffix='.pdf')
             temp_pdf_path = temp_pdf.name
             temp_pdf.close()
@@ -413,39 +365,43 @@ def process_directory(ftp, base_path, assistant):
             try:
                 # Download the file
                 with open(temp_pdf_path, 'wb') as local_file:
-                    ftp.retrbinary(f'RETR {item}', local_file.write)
+                    ftp.retrbinary(f'RETR {pdf_file}', local_file.write)
                 
                 # Upload to assistant
-                if upload_file_to_assistant(assistant, temp_pdf_path, item):
+                if upload_file_to_assistant(assistant, temp_pdf_path, pdf_file):
                     file_counters['succeeded'] += 1
                 else:
                     file_counters['failed'] += 1
                     
             except Exception as e:
-                logging.error(f"Error processing {item}: {str(e)}")
+                logging.error(f"Error processing {pdf_file}: {str(e)}")
                 file_counters['failed'] += 1
-                problematic_files['processing_failed'].append(item)
-                log_progress('error', f"Error processing {item}", {
-                    'file': item,
+                problematic_files['processing_failed'].append(pdf_file)
+                log_progress('error', f"Error processing {pdf_file}", {
+                    'file': pdf_file,
                     'error': str(e)
                 }, 'error')
             finally:
-                # Clean up temp file
                 if os.path.exists(temp_pdf_path):
                     os.unlink(temp_pdf_path)
         
         # Process subdirectories recursively
-        for subdir in subdirs:
+        for subdir in directories:
             logging.info(f"📁 Entering subdirectory: {subdir}")
             try:
                 ftp.cwd(subdir)
                 process_directory(ftp, f"{base_path}/{subdir}", assistant)
                 ftp.cwd('..')  # Go back up
+                logging.info(f"📁 Returned from subdirectory: {subdir}")
             except Exception as e:
                 logging.error(f"Error processing subdirectory {subdir}: {e}")
+                try:
+                    ftp.cwd('..')  # Try to go back up even if error
+                except:
+                    pass
                 
     except Exception as e:
-        logging.error(f"Error listing directory: {str(e)}")
+        logging.error(f"Error processing directory: {str(e)}")
         raise
 
 def generate_report():
@@ -489,7 +445,6 @@ def generate_report():
     print(f"Detailed report saved to: {report_file}")
     print("="*60)
     
-    # Send final summary to Supabase
     log_progress('summary', f"FTP to Pinecone process completed for {ASSISTANT_NAME}", {
         'run_id': RUN_ID,
         'assistant_name': ASSISTANT_NAME,
@@ -501,11 +456,8 @@ def generate_report():
     }, 'success')
 
 def reset_assistant(pc):
-    """
-    Reset the Pinecone assistant by completely deleting and recreating it
-    """
+    """Reset the Pinecone assistant by completely deleting and recreating it"""
     try:
-        # Try to delete the existing assistant
         try:
             logging.info(f"Deleting assistant: {ASSISTANT_NAME}")
             log_progress('assistant', f"Deleting assistant: {ASSISTANT_NAME}")
@@ -517,7 +469,6 @@ def reset_assistant(pc):
             logging.warning(deletion_msg)
             log_progress('assistant', deletion_msg, {}, 'warning')
             
-        # Create the assistant with enhanced TBSG instructions
         logging.info(f"Creating new assistant: {ASSISTANT_NAME}")
         log_progress('assistant', f"Creating new assistant: {ASSISTANT_NAME}")
         assistant = pc.assistant.create_assistant(
@@ -546,50 +497,41 @@ def main():
     script_start_time = datetime.now()
     
     try:
-        # Log script start with assistant information
         start_msg = f"FTP to Pinecone script started for {ASSISTANT_NAME} (Run ID: {RUN_ID})"
         logging.info(start_msg)
         log_progress('start', start_msg)
         
-        # Connect with TLS using ReusedSslFTP
+        # Connect with TLS
         ftp = ReusedSslFTP(FTP_SERVER, timeout=30)
         ftp.login(FTP_USERNAME, FTP_PASSWORD)
-        ftp.prot_p()  # Enable encryption for data channel
+        ftp.prot_p()
         ftp.set_pasv(True)
-        
-        # Enable keepalive to prevent connection timeouts
         ftp.sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        
         connection_msg = f"Connected to FTP server: {FTP_SERVER}"
         logging.info(connection_msg)
         log_progress('connect', connection_msg, {
-            'server': FTP_SERVER.replace('ftp://', '').split('@')[0]  # Don't log credentials
+            'server': FTP_SERVER.replace('ftp://', '').split('@')[0]
         }, 'success')
         
         # Initialize Pinecone
         pc = Pinecone(api_key=PINECONE_API_KEY)
         log_progress('pinecone', "Connected to Pinecone API")
         
-        # Reset assistant - delete and recreate completely
+        # Reset assistant
         assistant = reset_assistant(pc)
         
-        # Add retry logic for FTP operations
-        max_retries = 3
-        retry_delay = 5
-        
-        # OPTIMIZATION: Skip slow scan phase - process files directly
-        # The scan was taking 10+ minutes for ~65 files due to FTP connection delays
-        # File count will be tracked during processing instead
+        # Navigate to folder
         logging.info(f"Starting file processing in {FTP_FOLDER}...")
-        log_progress('scan', f"Processing files in {FTP_FOLDER} (count will be determined during processing)")
+        log_progress('scan', f"Processing files in {FTP_FOLDER}")
         
-        # Navigate to the correct folder path (handles spaces and nested paths)
         navigate_to_ftp_folder(ftp, FTP_FOLDER)
         
-        # VERIFY PATH - NEW DIAGNOSTIC STEP
+        # Verify path
         logging.info("="*60)
         logging.info("VERIFYING FTP PATH")
         logging.info("="*60)
-        path_ok, items = verify_ftp_path(ftp, FTP_FOLDER)
+        path_ok, files, directories = verify_ftp_path(ftp, FTP_FOLDER)
         
         if not path_ok:
             error_msg = f"❌ Failed to verify FTP path: {FTP_FOLDER}"
@@ -597,8 +539,8 @@ def main():
             log_progress('error', error_msg, {'path': FTP_FOLDER}, 'error')
             raise Exception(error_msg)
         
-        if len(items) == 0:
-            warning_msg = f"⚠️ WARNING: FTP directory is empty or contains no accessible files"
+        if len(files) == 0 and len(directories) == 0:
+            warning_msg = f"⚠️ WARNING: FTP directory is completely empty"
             logging.warning(warning_msg)
             log_progress('warning', warning_msg, {
                 'directory': ftp.pwd(),
@@ -607,23 +549,24 @@ def main():
         
         logging.info("="*60)
         
-        # Set total to 0 - will be incremented during processing
+        # Process directory
         file_counters['total'] = 0
+        
+        max_retries = 3
+        retry_delay = 5
         
         for attempt in range(max_retries):
             try:
-                # Establish fresh connection before accessing target folder
                 if attempt > 0:
                     ftp.quit()
                     ftp = ReusedSslFTP(FTP_SERVER, timeout=30)
                     ftp.login(FTP_USERNAME, FTP_PASSWORD)
-                    ftp.prot_p()  # Enable encryption for data channel
+                    ftp.prot_p()
                     ftp.set_pasv(True)
                     ftp.sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
                     logging.info(f"Reconnected to FTP server (attempt {attempt+1})")
                     log_progress('connect', f"Reconnected to FTP server (attempt {attempt+1})")
                 
-                # Navigate to the correct folder path (handles spaces and nested paths)
                 navigate_to_ftp_folder(ftp, FTP_FOLDER)
                 log_progress('processing', f"Starting to process files for {ASSISTANT_NAME}")
                 process_directory(ftp, FTP_FOLDER, assistant)
@@ -636,7 +579,6 @@ def main():
                     raise
                 time.sleep(retry_delay)
         
-        # Generate report and cleanup
         generate_report()
         ftp.quit()
         completion_msg = f"Script completed successfully for {ASSISTANT_NAME} from {FTP_FOLDER}."
