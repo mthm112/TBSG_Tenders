@@ -28,9 +28,9 @@ jobs:
 
       - name: Run SFTP ingest
         env:
-          SFTP_HOST: ${{ secrets.TBSG_SFTP_HOST }}   # e.g. sftp.tbsg.co.uk
-          SFTP_USER: ${{ secrets.TBSG_SFTP_USER }}   # e.g. metacog
-          SFTP_PASS: ${{ secrets.TBSG_SFTP_PASSWORD }}
+          SFTP_HOST: ${{ secrets.FTP_SERVER }}
+          SFTP_USER: ${{ secrets.FTP_USERNAME }}
+          SFTP_PASS: ${{ secrets.FTP_PASSWORD }}
         run: |
           python tbsg_horizon_sftp_ingest.py
 
