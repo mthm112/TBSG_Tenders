@@ -45,13 +45,8 @@ EXPECTED_FILES = {
     ],
     "pricing.csv": [
         "TRADER_ID", "CODE", "SKU", "QTY", "PRICE", "TYPE"
-    ],
-    "product_master.csv": [
-        "CODE", "DESCRIPTION", "COST", "SELL", "LOCALSTOCK",
-        "WHOLESALER STOCK", "UOM", "SUPPLIERCODE", "DISCONTINUED",
-        "MODIFIED", "PACK", "LEADTIME", "RANGE", "GROUP",
-        "SUBGROUP", "MANUFACTURER", "WEIGHT"
     ]
+    # product_master.csv removed - upload manually via local script
 }
 
 logging.basicConfig(
