@@ -1,47 +1,170 @@
-name: TBSG Horizon SFTP → Supabase
+name: TBSG FTP to Pinecone Sync
 
 on:
   workflow_dispatch:
-  schedule:
-    # Mon–Fri at 07:15 UTC
-    - cron: "15 7 * * 1-5"
+    inputs:
+      reason:
+        description: 'Reason for manual sync'
+        required: false
+        default: 'Manual document sync'
+  
+  # Optional: Schedule automatic syncs
+  # schedule:
+  #   - cron: '0 8 * * 1-5'  # 8am UTC Monday-Friday
 
 jobs:
-  horizon_ingest:
+  sync-documents:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-
+    
     steps:
-      - name: Checkout repository
+      - name: Checkout code
         uses: actions/checkout@v4
-
+      
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-
+          python-version: '3.10'
+      
+      - name: Generate Workflow Run ID
+        id: workflow_id
+        run: |
+          echo "WORKFLOW_RUN_ID=tbsg-sync-$(date +%Y%m%d%H%M%S)" >> $GITHUB_ENV
+          echo "TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_ENV
+      
+      - name: Set activation lock in Supabase
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: |
+          curl -X POST "$SUPABASE_URL/rest/v1/assistant_activation_lock" \
+            -H "apikey: $SUPABASE_KEY" \
+            -H "Authorization: Bearer $SUPABASE_KEY" \
+            -H "Content-Type: application/json" \
+            -H "Prefer: resolution=merge-duplicates" \
+            -d "{
+              \"assistant_name\": \"tbsg-tender-tool\",
+              \"locked_at\": \"${{ env.TIMESTAMP }}\",
+              \"locked_by\": \"ftp_sync_workflow\",
+              \"workflow_run_id\": \"${{ github.run_id }}\",
+              \"status\": \"activating\"
+            }"
+      
+      - name: Log sync start to Supabase
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: |
+          curl -X POST "$SUPABASE_URL/rest/v1/workflow_logs" \
+            -H "apikey: $SUPABASE_KEY" \
+            -H "Authorization: Bearer $SUPABASE_KEY" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"log_type\": \"info\",
+              \"message\": \"Starting FTP sync for tbsg-tender-tool\",
+              \"details\": {
+                \"assistant_name\": \"tbsg-tender-tool\",
+                \"folder_path\": \"/metacog/Tenders/BSG Policies and Procedures\",
+                \"stage\": \"sync_start\",
+                \"workflow_url\": \"https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}\"
+              },
+              \"run_id\": \"${{ env.WORKFLOW_RUN_ID }}\",
+              \"created_at\": \"${{ env.TIMESTAMP }}\"
+            }"
+      
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y poppler-utils tesseract-ocr
+      
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install paramiko
-          pip install supabase
-
-      - name: Run Horizon SFTP → Supabase pipeline
+          pip install pinecone requests python-dateutil PyPDF2 pdf2image pytesseract pillow
+      
+      - name: Sync FTP to Pinecone
         env:
-          # SFTP
-          SFTP_HOST: ${{ secrets.FTP_SERVER }}
-          SFTP_USER: ${{ secrets.FTP_USERNAME }}
-          SFTP_PASS: ${{ secrets.FTP_PASSWORD }}
-
-          # Supabase
+          FTP_SERVER: ${{ secrets.FTP_SERVER }}
+          FTP_USERNAME: ${{ secrets.FTP_USERNAME }}
+          FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
+          PINECONE_API_KEY: ${{ secrets.PINECONE_API_KEY }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          WORKFLOW_RUN_ID: ${{ env.WORKFLOW_RUN_ID }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
-          python tbsg_horizon_sftp_ingest.py
-
-      - name: Upload CSV artifacts (debugging)
+          echo "=========================================="
+          echo "TBSG Document Sync"
+          echo "Assistant: tbsg-tender-tool"
+          echo "Folder: /metacog/Tenders/BSG Policies and Procedures"
+          echo "Time: $(date)"
+          echo "=========================================="
+          
+          python ftp_to_pinecone.py \
+            --assistant-name "tbsg-tender-tool" \
+            --folder-path "metacog/Tenders/BSG Policies and Procedures"
+      
+      - name: Record usage timestamp
+        if: success()
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: |
+          curl -X POST "$SUPABASE_URL/rest/v1/assistant_usage" \
+            -H "apikey: $SUPABASE_KEY" \
+            -H "Authorization: Bearer $SUPABASE_KEY" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"assistant_name\": \"tbsg-tender-tool\",
+              \"action\": \"activated_ftp_sync\",
+              \"timestamp\": \"${{ env.TIMESTAMP }}\"
+            }"
+      
+      - name: Log completion status
+        if: always()
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: |
+          STATUS="${{ job.status }}"
+          LOG_TYPE="success"
+          MESSAGE="✅ tbsg-tender-tool sync completed successfully"
+          
+          if [[ "$STATUS" != "success" ]]; then
+            LOG_TYPE="error"
+            MESSAGE="❌ tbsg-tender-tool sync failed"
+          fi
+          
+          curl -X POST "$SUPABASE_URL/rest/v1/workflow_logs" \
+            -H "apikey: $SUPABASE_KEY" \
+            -H "Authorization: Bearer $SUPABASE_KEY" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"log_type\": \"$LOG_TYPE\",
+              \"message\": \"$MESSAGE\",
+              \"details\": {
+                \"assistant_name\": \"tbsg-tender-tool\",
+                \"status\": \"$STATUS\",
+                \"stage\": \"sync_complete\"
+              },
+              \"run_id\": \"${{ env.WORKFLOW_RUN_ID }}\",
+              \"created_at\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"
+            }"
+      
+      - name: Clear activation lock
+        if: always()
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: |
+          curl -X DELETE "$SUPABASE_URL/rest/v1/assistant_activation_lock?assistant_name=eq.tbsg-tender-tool" \
+            -H "apikey: $SUPABASE_KEY" \
+            -H "Authorization: Bearer $SUPABASE_KEY"
+      
+      - name: Upload logs
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: horizon-csvs
-          path: downloads/
-          if-no-files-found: error
+          name: sync-logs-${{ github.run_number }}
+          path: '*.log'
+          retention-days: 7
