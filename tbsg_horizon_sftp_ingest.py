@@ -3,6 +3,7 @@ import sys
 import csv
 import logging
 import paramiko
+from supabase import create_client, Client
 
 # ---------------------------------------------------------
 # CONFIG
@@ -12,32 +13,26 @@ SFTP_HOST = os.getenv("SFTP_HOST")
 SFTP_USER = os.getenv("SFTP_USER")
 SFTP_PASS = os.getenv("SFTP_PASS")
 
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+
 REMOTE_BASE_PATH = "/metacog/Horizon"
 LOCAL_DOWNLOAD_DIR = "downloads"
+BATCH_SIZE = 1000
 
-EXPECTED_FILES = {
-    "customer_master.csv": [
-        "customer_code","customer_name","contact_name","email_address",
-        "telephone","mobile","line1","line2","line3","town","county",
-        "postcode","status","credit_limit","payment_terms",
-        "rep_name","rep_email","vat_no","co_reg","account_opened",
-        "modified","trader_id","account_trader_id"
-    ],
-    "order_history.csv": [
-        "entry_id","order_number","order_line_number","customer_code",
-        "trader_id","product_code","order_date","qty_ordered",
-        "unit_price","line_total","order_status","modified",
-        "delivery_date","discount","rep","source","quote exists"
-    ],
-    "order_status.csv": [
-        "OUR REFERENCE","YOUR REFERENCE","ORDER DATE","STATUS",
-        "OS ITEMS","LAST DELIVERY","TRACKING","MAX DUE",
-        "VAN TODAY","POSTCODE","RECEIVED BY","RECEIVED",
-        "EST DESPATCH","DEL BEFORE YOU","EVOXREF"
-    ],
-    "pricing.csv": [
-        "TRADER_ID","CODE","SKU","QTY","PRICE","TYPE"
-    ]
+FILES = {
+    "customer_master.csv": {
+        "table": "horizon.customer_master"
+    },
+    "order_history.csv": {
+        "table": "horizon.order_history"
+    },
+    "order_status.csv": {
+        "table": "horizon.order_status"
+    },
+    "pricing.csv": {
+        "table": "horizon.pricing"
+    }
 }
 
 # ---------------------------------------------------------
@@ -48,11 +43,17 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
-logger = logging.getLogger("tbsg-horizon-ingest")
+logger = logging.getLogger("tbsg-horizon-pipeline")
 
 # ---------------------------------------------------------
-# SFTP CONNECTION
+# UTILS
 # ---------------------------------------------------------
+
+def require_env(name: str):
+    val = os.getenv(name)
+    if not val:
+        raise RuntimeError(f"Missing required environment variable: {name}")
+    return val
 
 def connect_sftp():
     transport = paramiko.Transport((SFTP_HOST, 22))
@@ -60,54 +61,72 @@ def connect_sftp():
     sftp = paramiko.SFTPClient.from_transport(transport)
     return sftp, transport
 
-# ---------------------------------------------------------
-# CSV VALIDATION
-# ---------------------------------------------------------
-
-def validate_csv_schema(file_path, expected_columns):
-    with open(file_path, newline="", encoding="utf-8") as f:
-        reader = csv.reader(f)
-        header = next(reader)
-
-    missing = [c for c in expected_columns if c not in header]
-    if missing:
-        raise ValueError(f"Missing columns in {os.path.basename(file_path)}: {missing}")
+def clean_row(row: dict) -> dict:
+    """Convert empty strings to None for Supabase"""
+    return {k.lower().replace(" ", "_"): (v if v != "" else None) for k, v in row.items()}
 
 # ---------------------------------------------------------
-# MAIN INGESTION
+# SUPABASE
+# ---------------------------------------------------------
+
+def upload_csv_to_supabase(supabase: Client, table: str, csv_path: str):
+    logger.info(f"Uploading {csv_path} → {table}")
+
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        rows = [clean_row(r) for r in reader]
+
+    total = len(rows)
+    logger.info(f"{total:,} rows to upload")
+
+    for i in range(0, total, BATCH_SIZE):
+        batch = rows[i:i + BATCH_SIZE]
+        supabase.table(table).insert(batch).execute()
+
+        uploaded = min(i + BATCH_SIZE, total)
+        pct = (uploaded / total) * 100
+        logger.info(f"{table}: {uploaded:,}/{total:,} ({pct:.1f}%)")
+
+# ---------------------------------------------------------
+# MAIN
 # ---------------------------------------------------------
 
 def main():
-    if not SFTP_HOST or not SFTP_USER or not SFTP_PASS:
-        raise RuntimeError("Missing required SFTP environment variables: SFTP_HOST, SFTP_USER, SFTP_PASS")
+    require_env("SFTP_HOST")
+    require_env("SFTP_USER")
+    require_env("SFTP_PASS")
+    require_env("SUPABASE_URL")
+    require_env("SUPABASE_SERVICE_ROLE_KEY")
 
     os.makedirs(LOCAL_DOWNLOAD_DIR, exist_ok=True)
+
+    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
     logger.info("Connecting to SFTP...")
     sftp, transport = connect_sftp()
 
     try:
-        for filename, schema in EXPECTED_FILES.items():
+        for filename, cfg in FILES.items():
             remote_path = f"{REMOTE_BASE_PATH}/{filename}"
             local_path = os.path.join(LOCAL_DOWNLOAD_DIR, filename)
 
             logger.info(f"Downloading {filename}")
             sftp.get(remote_path, local_path)
 
-            file_size = os.path.getsize(local_path)
-            logger.info(f"Downloaded {filename} ({file_size:,} bytes)")
+            size = os.path.getsize(local_path)
+            logger.info(f"Downloaded {filename} ({size:,} bytes)")
 
-            validate_csv_schema(local_path, schema)
-            logger.info(f"Schema validated: {filename}")
+            upload_csv_to_supabase(
+                supabase=supabase,
+                table=cfg["table"],
+                csv_path=local_path
+            )
 
-        logger.info("Horizon ingest completed successfully (product data excluded)")
+        logger.info("✅ Horizon SFTP → Supabase pipeline completed")
 
     finally:
         try:
             sftp.close()
-        except Exception:
-            pass
-        try:
             transport.close()
         except Exception:
             pass
@@ -120,5 +139,5 @@ if __name__ == "__main__":
     try:
         main()
     except Exception:
-        logger.exception("Ingestion failed")
+        logger.exception("Pipeline failed")
         sys.exit(1)
