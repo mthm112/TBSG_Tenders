@@ -1,10 +1,8 @@
 import os
-import io
 import sys
 import csv
 import logging
 import paramiko
-from datetime import datetime
 
 # ---------------------------------------------------------
 # CONFIG
@@ -39,12 +37,6 @@ EXPECTED_FILES = {
     ],
     "pricing.csv": [
         "TRADER_ID","CODE","SKU","QTY","PRICE","TYPE"
-    ],
-    "product_master.csv": [
-        "CODE","DESCRIPTION","COST","SELL","LOCALSTOCK",
-        "WHOLESALER STOCK","UOM","SUPPLIERCODE","DISCONTINUED",
-        "MODIFIED","PACK","LEADTIME","RANGE","GROUP",
-        "SUBGROUP","MANUFACTURER","WEIGHT"
     ]
 }
 
@@ -65,7 +57,8 @@ logger = logging.getLogger("tbsg-horizon-ingest")
 def connect_sftp():
     transport = paramiko.Transport((SFTP_HOST, 22))
     transport.connect(username=SFTP_USER, password=SFTP_PASS)
-    return paramiko.SFTPClient.from_transport(transport), transport
+    sftp = paramiko.SFTPClient.from_transport(transport)
+    return sftp, transport
 
 # ---------------------------------------------------------
 # CSV VALIDATION
@@ -78,13 +71,18 @@ def validate_csv_schema(file_path, expected_columns):
 
     missing = [c for c in expected_columns if c not in header]
     if missing:
-        raise ValueError(f"Missing columns in {os.path.basename(file_path)}: {missing}")
+        raise ValueError(
+            f"Missing columns in {os.path.basename(file_path)}: {missing}"
+        )
 
 # ---------------------------------------------------------
 # MAIN INGESTION
 # ---------------------------------------------------------
 
 def main():
+    if not SFTP_HOST or not SFTP_USER or not SFTP_PASS:
+        raise RuntimeError("Missing required SFTP environment variables")
+
     os.makedirs(LOCAL_DOWNLOAD_DIR, exist_ok=True)
 
     logger.info("Connecting to SFTP…")
@@ -104,16 +102,24 @@ def main():
             validate_csv_schema(local_path, schema)
             logger.info(f"Schema validated: {filename}")
 
-        logger.info("✅ All Horizon files downloaded and validated successfully")
+        logger.info("✅ Horizon ingest completed successfully (product data excluded)")
 
     finally:
-        sftp.close()
-        transport.close()
+        try:
+            sftp.close()
+        except Exception:
+            pass
+        try:
+            transport.close()
+        except Exception:
+            pass
+
+# ---------------------------------------------------------
+# ENTRYPOINT
+# ---------------------------------------------------------
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        logger.error(f"❌ Ingestion failed: {e}")
-        sys.exit(1)
-
+        logger.error(f"❌ In
