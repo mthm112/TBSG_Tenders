@@ -3,7 +3,6 @@ name: TBSG Horizon SFTP → Supabase
 on:
   workflow_dispatch:
   schedule:
-    # Mon–Fri at 07:15 UTC (UK time: GMT in winter, BST in summer)
     - cron: "15 7 * * 1-5"
 
 jobs:
@@ -19,27 +18,37 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
 
-      - name: Install dependencies
+      - name: Verify Python & Pip
+        run: |
+          which python
+          python --version
+          python -m pip --version
+
+      - name: Install Python dependencies (CORRECT WAY)
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          python -m pip install paramiko supabase
+
+      - name: Verify paramiko install
+        run: |
+          python - << 'EOF'
+          import paramiko
+          print("paramiko OK:", paramiko.__version__)
+          EOF
 
       - name: Run Horizon SFTP → Supabase pipeline
         env:
-          # SFTP (already exists in your repo)
           SFTP_HOST: ${{ secrets.FTP_SERVER }}
           SFTP_USER: ${{ secrets.FTP_USERNAME }}
           SFTP_PASS: ${{ secrets.FTP_PASSWORD }}
 
-          # Supabase (must be service role)
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: |
           python tbsg_horizon_sftp_ingest.py
 
-      - name: Upload CSV artifacts (debugging)
+      - name: Upload CSV artifacts
         uses: actions/upload-artifact@v4
         with:
           name: horizon-csvs
