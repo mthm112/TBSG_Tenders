@@ -1,18 +1,18 @@
-name: TBSG Horizon SFTP Ingest
+name: TBSG Horizon SFTP → Supabase
 
 on:
   workflow_dispatch:
   schedule:
-    # Mon–Fri 07:15 (GitHub cron is UTC). UK is UTC in winter, UTC+1 in summer.
+    # Mon–Fri at 07:15 UTC (UK time: GMT in winter, BST in summer)
     - cron: "15 7 * * 1-5"
 
 jobs:
-  ingest:
+  horizon_ingest:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -24,19 +24,24 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install paramiko
+          pip install -r requirements.txt
 
-      - name: Run SFTP ingest
+      - name: Run Horizon SFTP → Supabase pipeline
         env:
+          # SFTP (already exists in your repo)
           SFTP_HOST: ${{ secrets.FTP_SERVER }}
           SFTP_USER: ${{ secrets.FTP_USERNAME }}
           SFTP_PASS: ${{ secrets.FTP_PASSWORD }}
+
+          # Supabase (must be service role)
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: |
           python tbsg_horizon_sftp_ingest.py
 
-      - name: Upload downloaded CSVs as artifact
+      - name: Upload CSV artifacts (debugging)
         uses: actions/upload-artifact@v4
         with:
-          name: tbsg-horizon-csvs
+          name: horizon-csvs
           path: downloads/
           if-no-files-found: error
