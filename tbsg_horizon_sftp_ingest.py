@@ -71,9 +71,7 @@ def validate_csv_schema(file_path, expected_columns):
 
     missing = [c for c in expected_columns if c not in header]
     if missing:
-        raise ValueError(
-            f"Missing columns in {os.path.basename(file_path)}: {missing}"
-        )
+        raise ValueError(f"Missing columns in {os.path.basename(file_path)}: {missing}")
 
 # ---------------------------------------------------------
 # MAIN INGESTION
@@ -81,11 +79,11 @@ def validate_csv_schema(file_path, expected_columns):
 
 def main():
     if not SFTP_HOST or not SFTP_USER or not SFTP_PASS:
-        raise RuntimeError("Missing required SFTP environment variables")
+        raise RuntimeError("Missing required SFTP environment variables: SFTP_HOST, SFTP_USER, SFTP_PASS")
 
     os.makedirs(LOCAL_DOWNLOAD_DIR, exist_ok=True)
 
-    logger.info("Connecting to SFTP…")
+    logger.info("Connecting to SFTP...")
     sftp, transport = connect_sftp()
 
     try:
@@ -102,7 +100,7 @@ def main():
             validate_csv_schema(local_path, schema)
             logger.info(f"Schema validated: {filename}")
 
-        logger.info("✅ Horizon ingest completed successfully (product data excluded)")
+        logger.info("Horizon ingest completed successfully (product data excluded)")
 
     finally:
         try:
@@ -121,5 +119,6 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except Exception as e:
-        logger.error(f"❌ In
+    except Exception:
+        logger.exception("Ingestion failed")
+        sys.exit(1)
