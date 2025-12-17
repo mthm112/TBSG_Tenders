@@ -19,9 +19,9 @@ REMOTE_BASE_PATH = "/metacog/Horizon"
 LOCAL_DOWNLOAD_DIR = "downloads"
 
 CONNECTION_TIMEOUT = 30
-SOCKET_TIMEOUT = 600  # 10 minutes
-CHUNK_SIZE = 1024 * 1024  # 1MB chunks for manual reading
-MAX_RETRIES = 3
+SOCKET_TIMEOUT = 600
+CHUNK_SIZE = 65536  # 64KB chunks (smaller for troubleshooting)
+MAX_RETRIES = 2
 
 EXPECTED_FILES = {
     "customer_master.csv": [
@@ -75,58 +75,82 @@ def validate_csv_schema(file_path: str, expected_columns: list[str]) -> None:
         raise ValueError(f"Missing columns in {os.path.basename(file_path)}: {missing}")
 
 def connect_sftp(host: str, user: str, password: str):
-    """Simple, robust SFTP connection"""
+    """Ultra-conservative SFTP connection"""
+    logger.info("Creating socket...")
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(CONNECTION_TIMEOUT)
+    
+    logger.info(f"Connecting to {host}:22...")
     sock.connect((host, 22))
+    
+    logger.info("Setting socket timeout to 600s...")
     sock.settimeout(SOCKET_TIMEOUT)
     
+    logger.info("Creating transport...")
     transport = paramiko.Transport(sock)
+    
+    logger.info("Setting keepalive...")
     transport.set_keepalive(30)
     
-    # Smaller window to avoid issues
-    transport.window_size = 1024 * 1024  # 1MB
-    transport.default_max_packet_size = 32768  # 32KB
+    # Ultra-conservative settings
+    transport.window_size = 524288  # 512KB
+    transport.default_max_packet_size = 16384  # 16KB
     
+    logger.info("Authenticating...")
     transport.connect(username=user, password=password)
+    
+    logger.info("Creating SFTP client...")
     sftp = paramiko.SFTPClient.from_transport(transport)
     
+    # Set aggressive timeouts on the channel
+    channel = sftp.get_channel()
+    channel.settimeout(SOCKET_TIMEOUT)
+    
+    logger.info("✅ SFTP connection established")
     return sftp, transport
 
-def download_file_chunked(sftp, remote_path: str, local_path: str, filename: str):
+def download_file_with_prefetch(sftp, remote_path: str, local_path: str, filename: str):
     """
-    Manual chunked download - bypasses paramiko's get() method entirely.
-    This avoids whatever buffer/packet issue is causing the 20MB hang.
+    Use SFTP prefetch which tells server to start sending data immediately.
+    This often fixes hanging issues.
     """
-    logger.info(f"Opening remote file: {filename}")
-    
-    # Get file size
+    logger.info(f"Getting file stats for: {filename}")
     remote_attrs = sftp.stat(remote_path)
     total_size = remote_attrs.st_size
     logger.info(f"Remote file size: {total_size:,} bytes")
     
-    # Open remote file for reading
-    remote_file = sftp.open(remote_path, 'rb')
+    logger.info(f"Opening remote file: {filename}")
+    remote_file = sftp.file(remote_path, 'rb')
     
-    # Set buffer size
-    remote_file.set_pipelined(True)
+    # KEY: Use prefetch to tell server to start sending data
+    logger.info(f"Starting prefetch...")
+    remote_file.prefetch(total_size)
+    logger.info(f"Prefetch started, beginning download...")
     
     downloaded = 0
     last_log = 0
-    log_interval = 10 * 1024 * 1024  # Log every 10MB
+    log_interval = 5 * 1024 * 1024  # Log every 5MB
     start_time = time.time()
     last_time = start_time
     last_bytes = 0
     
     try:
         with open(local_path, 'wb') as local_file:
-            while True:
-                # Read chunk
-                chunk = remote_file.read(CHUNK_SIZE)
+            chunk_count = 0
+            while downloaded < total_size:
+                # Read chunk with explicit size
+                remaining = total_size - downloaded
+                read_size = min(CHUNK_SIZE, remaining)
+                
+                logger.info(f"Reading chunk {chunk_count + 1} ({read_size:,} bytes)...")
+                chunk = remote_file.read(read_size)
+                chunk_count += 1
+                
                 if not chunk:
+                    logger.warning(f"Empty chunk received at {downloaded}/{total_size}")
                     break
                 
-                # Write chunk
+                logger.info(f"Writing chunk {chunk_count} ({len(chunk):,} bytes)...")
                 local_file.write(chunk)
                 downloaded += len(chunk)
                 
@@ -139,9 +163,9 @@ def download_file_chunked(sftp, remote_path: str, local_path: str, filename: str
                     if elapsed > 0:
                         chunk_bytes = downloaded - last_bytes
                         speed_mbps = (chunk_bytes / elapsed) / (1024 * 1024)
-                        logger.info(f"{filename}: {pct:.1f}% ({downloaded:,}/{total_size:,} bytes) - {speed_mbps:.2f} MB/s")
+                        logger.info(f"✅ {filename}: {pct:.1f}% ({downloaded:,}/{total_size:,}) - {speed_mbps:.2f} MB/s")
                     else:
-                        logger.info(f"{filename}: {pct:.1f}% ({downloaded:,}/{total_size:,} bytes)")
+                        logger.info(f"✅ {filename}: {pct:.1f}% ({downloaded:,}/{total_size:,})")
                     
                     last_log = downloaded
                     last_time = current_time
@@ -156,20 +180,28 @@ def download_file_chunked(sftp, remote_path: str, local_path: str, filename: str
         logger.info(f"✅ Downloaded {filename} ({downloaded:,} bytes in {total_time:.1f}s, avg {avg_speed:.2f} MB/s)")
         
     finally:
+        logger.info("Closing remote file...")
         remote_file.close()
 
 def download_with_retry(sftp, remote_path: str, local_path: str, filename: str):
-    """Retry wrapper for chunked download"""
+    """Retry wrapper"""
     for attempt in range(1, MAX_RETRIES + 1):
         try:
+            logger.info(f"\n{'='*60}")
+            logger.info(f"Download attempt {attempt}/{MAX_RETRIES} for {filename}")
+            logger.info(f"{'='*60}")
+            
             if os.path.exists(local_path):
+                logger.info(f"Removing existing file: {local_path}")
                 os.remove(local_path)
             
-            download_file_chunked(sftp, remote_path, local_path, filename)
+            download_file_with_prefetch(sftp, remote_path, local_path, filename)
             return
             
         except Exception as e:
             logger.error(f"❌ Download failed (attempt {attempt}/{MAX_RETRIES}): {e}")
+            logger.exception("Full traceback:")
+            
             if attempt < MAX_RETRIES:
                 logger.info(f"Retrying in 5 seconds...")
                 time.sleep(5)
@@ -184,7 +216,7 @@ def main():
     os.makedirs(LOCAL_DOWNLOAD_DIR, exist_ok=True)
 
     logger.info("=" * 60)
-    logger.info("TBSG Horizon SFTP Ingest - Chunked Version")
+    logger.info("TBSG Horizon SFTP Ingest - Prefetch Version")
     logger.info(f"Chunk size: {CHUNK_SIZE:,} bytes")
     logger.info("=" * 60)
 
@@ -193,16 +225,19 @@ def main():
     
     try:
         sftp, transport = connect_sftp(host, user, password)
-        logger.info("✅ SFTP connected")
 
+        logger.info("Checking remote directory...")
         try:
-            sftp.listdir(REMOTE_BASE_PATH)
+            files = sftp.listdir(REMOTE_BASE_PATH)
             logger.info(f"✅ Remote path accessible: {REMOTE_BASE_PATH}")
+            logger.info(f"Found {len(files)} files")
         except Exception as e:
             raise RuntimeError(f"Remote path not accessible: {REMOTE_BASE_PATH}. Error: {e}")
 
         for idx, (filename, schema) in enumerate(EXPECTED_FILES.items(), 1):
-            logger.info(f"\n[{idx}/{len(EXPECTED_FILES)}] Processing {filename}")
+            logger.info(f"\n{'#'*60}")
+            logger.info(f"[{idx}/{len(EXPECTED_FILES)}] Processing {filename}")
+            logger.info(f"{'#'*60}")
             
             remote_path = f"{REMOTE_BASE_PATH}/{filename}"
             local_path = os.path.join(LOCAL_DOWNLOAD_DIR, filename)
@@ -214,7 +249,7 @@ def main():
             logger.info(f"✅ Schema validated: {filename}")
 
         logger.info("\n" + "=" * 60)
-        logger.info("✅ All files downloaded and validated successfully")
+        logger.info("✅ ALL FILES DOWNLOADED AND VALIDATED")
         logger.info("=" * 60)
 
     except Exception as e:
@@ -224,21 +259,24 @@ def main():
     finally:
         if sftp:
             try:
+                logger.info("Closing SFTP...")
                 sftp.close()
-            except:
-                pass
+            except Exception as e:
+                logger.warning(f"Error closing SFTP: {e}")
+        
         if transport:
             try:
+                logger.info("Closing transport...")
                 transport.close()
-            except:
-                pass
+            except Exception as e:
+                logger.warning(f"Error closing transport: {e}")
 
 if __name__ == "__main__":
     try:
         start_time = time.time()
         main()
         elapsed = time.time() - start_time
-        logger.info(f"\nTotal execution time: {elapsed:.2f} seconds")
+        logger.info(f"\n✅ Total execution time: {elapsed:.2f} seconds")
         sys.exit(0)
     except Exception as e:
         logger.error(f"\n❌ Fatal error: {e}")
