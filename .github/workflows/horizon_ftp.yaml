@@ -1,0 +1,42 @@
+name: TBSG Horizon SFTP Ingest
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Mon–Fri 07:15 (GitHub cron is UTC). UK is UTC in winter, UTC+1 in summer.
+    - cron: "15 7 * * 1-5"
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install paramiko
+
+      - name: Run SFTP ingest
+        env:
+          SFTP_HOST: ${{ secrets.TBSG_SFTP_HOST }}   # e.g. sftp.tbsg.co.uk
+          SFTP_USER: ${{ secrets.TBSG_SFTP_USER }}   # e.g. metacog
+          SFTP_PASS: ${{ secrets.TBSG_SFTP_PASSWORD }}
+        run: |
+          python tbsg_horizon_sftp_ingest.py
+
+      - name: Upload downloaded CSVs as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tbsg-horizon-csvs
+          path: downloads/
+          if-no-files-found: error
