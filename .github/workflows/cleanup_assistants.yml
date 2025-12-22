@@ -49,13 +49,13 @@ jobs:
         
         # Convert to UK time (approximate - UTC+0 in winter, UTC+1 in summer)
         # For simplicity, we check UTC hour ranges that cover both GMT and BST
-        # Business hours: 9am-5pm UK time
-        # GMT (winter): 9am-5pm = 9:00-17:00 UTC
-        # BST (summer): 9am-5pm = 8:00-16:00 UTC
-        # Safe range: Skip cleanup between 8:00-17:00 UTC on weekdays
+        # Business hours: 6am-5pm UK time (Carol starts at 7:15am, we load docs at 5am UTC)
+        # GMT (winter): 6am-5pm = 06:00-17:00 UTC
+        # BST (summer): 6am-5pm = 05:00-16:00 UTC
+        # Safe range: Skip cleanup between 5:00-17:00 UTC on weekdays
         
         is_weekday = now.weekday() < 5  # Monday=0, Friday=4
-        is_business_hour = 8 <= now.hour < 17  # Adjusted for testing flexibility
+        is_business_hour = 5 <= now.hour < 17  # Protects 5am sync and Carol's working hours
         is_business_hours = is_weekday and is_business_hour
         
         force = "${{ github.event.inputs.force }}" == "true"
@@ -64,8 +64,10 @@ jobs:
             print(f"⚠️  BUSINESS HOURS DETECTED")
             print(f"Current time (UTC): {now.strftime('%A %H:%M')}")
             print(f"Day: {now.strftime('%A')} (weekday={is_weekday})")
-            print(f"Hour: {now.hour} UTC (business hours: 8-17 UTC)")
-            print(f"Cleanup will be skipped to protect active assistants")
+            print(f"Hour: {now.hour} UTC (business hours: 5-17 UTC)")
+            print(f"Cleanup will be skipped to protect:")
+            print(f"  - 5am UTC daily sync")
+            print(f"  - Carol's working hours (6am-5pm UK time)")
             print(f"")
             print(f"To force cleanup during business hours, use:")
             print(f"  workflow_dispatch with force=true")
