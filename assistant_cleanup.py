@@ -141,7 +141,8 @@ def check_activation_locks(supabase_url, supabase_key):
 
 def is_business_hours():
     """
-    Check if current time is during UK business hours (9am-5pm Monday-Friday)
+    Check if current time is during UK business hours or daily sync time
+    Protects: 5am UTC daily sync + Carol's working hours (6am-5pm UK time)
     
     Returns: (is_business_hours: bool, current_time: datetime, reason: str)
     """
@@ -150,17 +151,22 @@ def is_business_hours():
     # Check if it's a weekday (Monday=0, Friday=4)
     is_weekday = now.weekday() < 5
     
-    # Business hours: 9am-5pm UK time
-    # GMT (winter): 9am-5pm UK = 9:00-17:00 UTC
-    # BST (summer): 9am-5pm UK = 8:00-16:00 UTC
-    # Safe range: 8:00-17:00 UTC covers both scenarios
-    # Adjusted to end at 5pm UTC for testing flexibility
-    is_business_hour = 8 <= now.hour < 17
+    # Protected hours: 5am-5pm UTC weekdays
+    # Protects:
+    # - 5am UTC: Daily FTP sync (runs Mon-Fri at 5am UTC)
+    # - 6am-5pm UK time: Carol's working hours
+    #   GMT (winter): 6am-5pm UK = 6:00-17:00 UTC
+    #   BST (summer): 6am-5pm UK = 5:00-16:00 UTC
+    # Safe range: 5:00-17:00 UTC covers sync + working hours in both timezones
+    is_business_hour = 5 <= now.hour < 17
     
     is_business = is_weekday and is_business_hour
     
     if is_business:
-        reason = f"Business hours detected: {now.strftime('%A %H:%M UTC')} (UK business hours: 9am-5pm Mon-Fri)"
+        if now.hour == 5:
+            reason = f"Daily sync time: {now.strftime('%A %H:%M UTC')} (FTP sync runs 5am UTC Mon-Fri)"
+        else:
+            reason = f"Business hours detected: {now.strftime('%A %H:%M UTC')} (Carol's hours: 6am-5pm UK time)"
     else:
         if not is_weekday:
             reason = f"Weekend: {now.strftime('%A %H:%M UTC')}"
