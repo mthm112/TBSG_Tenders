@@ -8,9 +8,11 @@ on:
         required: false
         default: 'Manual document sync'
   
-  # Automatic sync at 5am UTC (6am GMT / 6am-7am BST) Monday-Friday
+  # Automatic sync at 6:55am UTC (~7:06am completion) Monday-Friday
+  # Finishes by 7:06am UTC = 7:06am GMT (winter) / 8:06am BST (summer)
+  # Ready before Carol starts at 7:15am UK time (GMT winter)
   schedule:
-    - cron: '0 5 * * 1-5'  # 5am UTC Monday-Friday
+    - cron: '55 6 * * 1-5'  # 6:55am UTC Monday-Friday
 
 jobs:
   sync-documents:
