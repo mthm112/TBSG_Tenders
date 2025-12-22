@@ -8,9 +8,9 @@ on:
         required: false
         default: 'Manual document sync'
   
-  # Optional: Schedule automatic syncs
-  # schedule:
-  #   - cron: '0 8 * * 1-5'  # 8am UTC Monday-Friday
+  # Automatic sync at 5am UTC (6am GMT / 6am-7am BST) Monday-Friday
+  schedule:
+    - cron: '0 5 * * 1-5'  # 5am UTC Monday-Friday
 
 jobs:
   sync-documents:
