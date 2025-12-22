@@ -1,537 +1,601 @@
-"""
-Automated Pinecone Assistant Cleanup Script for TBSG
-Deletes assistants that haven't been used for 2+ hours to save costs
-
-Run this as a scheduled job (cron/GitHub Actions) every hour
-
-Usage:
-    # Test what would be deleted (dry run)
-    python assistant_cleanup.py --dry-run
-    
-    # Actually delete inactive assistants (2 hour threshold)
-    python assistant_cleanup.py
-    
-    # Custom threshold (1 hour)
-    python assistant_cleanup.py --hours 1
-"""
-
 import os
-from datetime import datetime, timedelta
+import ftplib
+import logging
+import socket
+import shutil
+import argparse
+from datetime import datetime
+import tempfile
+import PyPDF2
+import time
+from pathlib import Path
+import re
+import pytesseract
+from pdf2image import convert_from_path
+import json
+from PIL import Image
 from pinecone import Pinecone
 import requests
-import logging
-import argparse
-from concurrent.futures import ThreadPoolExecutor, TimeoutError
-import time
+import sys
 
+# Add argument parser for assistant name and folder path
+parser = argparse.ArgumentParser(description='Sync documents from FTP to Pinecone Assistant')
+parser.add_argument('--assistant-name', type=str, help='Name of the Pinecone assistant')
+parser.add_argument('--folder-path', type=str, help='FTP folder path to sync from')
+args = parser.parse_args()
+
+# Get run ID from GitHub Actions
+RUN_ID = os.environ.get('WORKFLOW_RUN_ID', f"manual-{datetime.now().strftime('%Y%m%d%H%M%S')}")
+
+# Configure logging with unique run ID
+log_filename = f'ftp_to_pinecone_{RUN_ID}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(log_filename),
+        logging.StreamHandler()
+    ]
 )
 
-# Configuration
+# Get environment variables
+FTP_SERVER = os.environ.get('FTP_SERVER')
+FTP_USERNAME = os.environ.get('FTP_USERNAME')
+FTP_PASSWORD = os.environ.get('FTP_PASSWORD')
 PINECONE_API_KEY = os.environ.get('PINECONE_API_KEY')
 SUPABASE_URL = os.environ.get('SUPABASE_URL')
 SUPABASE_KEY = os.environ.get('SUPABASE_KEY')
-GITHUB_TOKEN = os.environ.get('GITHUB_TOKEN')  # Built-in GitHub Actions token
-GITHUB_OWNER = os.environ.get('GITHUB_OWNER', 'mthm112')
-GITHUB_REPO = os.environ.get('GITHUB_REPO', 'TBSG_Tenders')
 
-# Timeout settings
-DELETE_TIMEOUT_SECONDS = 120  # 2 minutes max per deletion
-MAX_RETRIES = 2  # Try twice if it fails
+# Add this custom FTP_TLS class for SSL session reuse
+class ReusedSslFTP(ftplib.FTP_TLS):
+    """FTP_TLS subclass that reuses the SSL session for data connections."""
+    def ntransfercmd(self, cmd, rest=None):
+        conn, size = ftplib.FTP.ntransfercmd(self, cmd, rest)
+        if self._prot_p:
+            conn = self.context.wrap_socket(conn,
+                                           server_hostname=self.host,
+                                           session=self.sock.session)
+        return conn, size
 
-# Assistants to monitor and clean up - TBSG has only one
-MANAGED_ASSISTANTS = [
-    'tbsg-tender-tool'
-]
+# Use command line arguments if provided, otherwise fall back to environment variables
+ASSISTANT_NAME = args.assistant_name or os.environ.get('ASSISTANT_NAME', 'tbsg-tender-tool')
+FTP_FOLDER = args.folder_path or os.environ.get('FTP_FOLDER', 'metacog/Tenders/BSG Policies and Procedures')
 
-def check_active_workflows(github_token, github_owner, github_repo):
-    """
-    Check if any FTP sync workflows are currently running
-    Returns: (has_active: bool, active_workflows: list)
-    """
-    if not github_token:
-        logging.warning("GitHub token not configured, cannot check for active workflows")
-        return False, []
+# Remove leading slash if present (for FTP compatibility)
+if FTP_FOLDER.startswith('/'):
+    FTP_FOLDER = FTP_FOLDER[1:]
+
+ASSISTANT_REGION = os.environ.get('ASSISTANT_REGION', 'us')
+
+# Log the configuration
+logging.info(f"Using assistant: {ASSISTANT_NAME}")
+logging.info(f"Using FTP folder: {FTP_FOLDER}")
+
+# TBSG-Specific Assistant Instructions with Barney's feedback incorporated
+ASSISTANT_INSTRUCTIONS = """You are a TBSG tender and policy assistant specialized in creating accurate, professional tender responses for the Business Supplies Group.
+
+CORE REQUIREMENTS:
+1. Language: Use British English spelling and terminology throughout all responses
+2. Accuracy: Provide clear, factual answers using only the uploaded TBSG documents (PDFs, Word documents, Excel files, etc.)
+3. Citations: Always reference the source document using the 'original_filename' metadata field and specific page numbers where applicable
+4. Format: "According to [original_filename], page X..." (or "According to [original_filename]..." if page numbers aren't available)
+
+RESPONSE GUIDELINES:
+1. Specificity: When asked for "a" or "the" (singular), provide ONLY ONE option, not multiple
+   - Example: "dedicated account manager" = provide ONE person only
+   - Example: "your solution" = describe ONE solution, not multiple options
+
+2. Context Awareness: Only include information relevant to the specific tender/client being answered
+   - Filter out references to other clients unless they are the subject of this tender
+   - Focus responses on the question at hand
+
+3. Word Count: Be professional yet concise
+   - Respect any word/character limits mentioned in questions
+   - Provide comprehensive answers without unnecessary verbosity
+   - Typical tender responses should be 100-300 words unless otherwise specified
+
+4. Professionalism: Maintain professional, confident tone appropriate for B2B tender submissions
+   - Use industry-standard terminology
+   - Be direct and specific
+   - Avoid hedging language unless genuinely uncertain
+
+5. Client-Specific Details: When context about the specific client/tender is provided, prioritize that information in your response
+
+If you cannot find relevant information in the documents to answer a question accurately, state: "This information is not available in the current documentation. Please consult with the relevant TBSG department for accurate details."
+"""
+
+# Validate required environment variables
+required_vars = {
+    'FTP_SERVER': FTP_SERVER,
+    'FTP_USERNAME': FTP_USERNAME,
+    'FTP_PASSWORD': FTP_PASSWORD,
+    'PINECONE_API_KEY': PINECONE_API_KEY
+}
+
+missing_vars = [key for key, value in required_vars.items() if not value]
+if missing_vars:
+    error_msg = f"Missing required environment variables: {', '.join(missing_vars)}"
+    logging.critical(error_msg)
+    sys.exit(1)
+
+# Track problematic files
+problematic_files = {
+    'ocr_needed': [],
+    'password_protected': [],
+    'upload_failed': [],
+    'processing_failed': []
+}
+
+# Counter for progress tracking
+file_counters = {
+    'processed': 0,
+    'succeeded': 0,
+    'failed': 0,
+    'total': 0
+}
+
+def send_log_to_supabase(log_type, message, details=None):
+    """Send log entry to Supabase for app visibility with improved real-time support."""
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        logging.warning("Supabase credentials not provided - logs won't be visible in app")
+        return False
     
     try:
-        logging.info("Checking for active FTP sync workflows...")
-        
-        response = requests.get(
-            f"https://api.github.com/repos/{github_owner}/{github_repo}/actions/runs",
-            headers={
-                'Authorization': f'Bearer {github_token}',
-                'Accept': 'application/vnd.github.v3+json'
-            },
-            params={
-                'status': 'in_progress',
-                'per_page': 20
-            },
-            timeout=10
-        )
-        
-        if response.status_code == 200:
-            workflows = response.json()
-            active_syncs = [
-                run for run in workflows.get('workflow_runs', [])
-                if run.get('name') == 'FTP to Pinecone Process' and run.get('status') == 'in_progress'
-            ]
-            
-            if active_syncs:
-                logging.info(f"Found {len(active_syncs)} active FTP sync workflow(s)")
-                for workflow in active_syncs:
-                    logging.info(f"  - Workflow #{workflow.get('id')}: started {workflow.get('created_at')}")
-            else:
-                logging.info("No active FTP sync workflows found")
-            
-            return len(active_syncs) > 0, active_syncs
-        else:
-            logging.warning(f"GitHub API returned status {response.status_code}")
-            return False, []
-        
-    except requests.exceptions.Timeout:
-        logging.error("Timeout checking GitHub workflows")
-        return False, []
-    except Exception as e:
-        logging.error(f"Error checking workflows: {e}")
-        return False, []
-
-def check_activation_locks(supabase_url, supabase_key):
-    """
-    Check if any assistants have active activation locks
-    Returns: (has_locks: bool, locked_assistants: list)
-    """
-    if not supabase_url or not supabase_key:
-        return False, []
-    
-    try:
-        headers = {
-            "apikey": supabase_key,
-            "Authorization": f"Bearer {supabase_key}"
+        log_data = {
+            "log_type": log_type,
+            "message": message,
+            "details": details or {},
+            "run_id": RUN_ID,
+            "created_at": datetime.now().isoformat()
         }
         
-        # Get all locks less than 25 minutes old
-        cutoff = (datetime.now() - timedelta(minutes=25)).isoformat()
+        # Add workflow URL to details if available
+        github_run_id = os.environ.get('GITHUB_RUN_ID')
+        if github_run_id and 'workflow_url' not in log_data['details']:
+            github_repo = os.environ.get('GITHUB_REPOSITORY', 'mthm112/TBSG_Tenders')
+            log_data['details']['workflow_url'] = f"https://github.com/{github_repo}/actions/runs/{github_run_id}"
         
-        response = requests.get(
-            f"{supabase_url}/rest/v1/assistant_activation_lock",
-            headers=headers,
-            params={
-                "locked_at": f"gte.{cutoff}"
-            },
-            timeout=10
-        )
+        # Add assistant information to details
+        log_data['details']['assistant_name'] = ASSISTANT_NAME
+        log_data['details']['ftp_folder'] = FTP_FOLDER
         
-        if response.status_code == 200:
-            locks = response.json()
-            
-            if locks:
-                logging.info(f"Found {len(locks)} active activation lock(s)")
-                for lock in locks:
-                    logging.info(f"  - {lock['assistant_name']}: locked at {lock['locked_at']}")
-            
-            return len(locks) > 0, [lock['assistant_name'] for lock in locks]
-        
-        return False, []
-        
-    except Exception as e:
-        logging.error(f"Error checking activation locks: {e}")
-        return False, []
-
-def is_business_hours():
-    """
-    Check if current time is during UK business hours or daily sync time
-    Protects: 5am UTC daily sync + Carol's working hours (6am-5pm UK time)
-    
-    Returns: (is_business_hours: bool, current_time: datetime, reason: str)
-    """
-    now = datetime.utcnow()
-    
-    # Check if it's a weekday (Monday=0, Friday=4)
-    is_weekday = now.weekday() < 5
-    
-    # Protected hours: 5am-5pm UTC weekdays
-    # Protects:
-    # - 5am UTC: Daily FTP sync (runs Mon-Fri at 5am UTC)
-    # - 6am-5pm UK time: Carol's working hours
-    #   GMT (winter): 6am-5pm UK = 6:00-17:00 UTC
-    #   BST (summer): 6am-5pm UK = 5:00-16:00 UTC
-    # Safe range: 5:00-17:00 UTC covers sync + working hours in both timezones
-    is_business_hour = 5 <= now.hour < 17
-    
-    is_business = is_weekday and is_business_hour
-    
-    if is_business:
-        if now.hour == 5:
-            reason = f"Daily sync time: {now.strftime('%A %H:%M UTC')} (FTP sync runs 5am UTC Mon-Fri)"
-        else:
-            reason = f"Business hours detected: {now.strftime('%A %H:%M UTC')} (Carol's hours: 6am-5pm UK time)"
-    else:
-        if not is_weekday:
-            reason = f"Weekend: {now.strftime('%A %H:%M UTC')}"
-        else:
-            reason = f"Outside business hours: {now.strftime('%A %H:%M UTC')}"
-    
-    return is_business, now, reason
-
-def get_last_usage_time(assistant_name, supabase_url, supabase_key):
-    """Get the last time an assistant was used from Supabase"""
-    if not supabase_url or not supabase_key:
-        logging.warning("Supabase not configured, cannot track usage times")
-        return None
-    
-    try:
         headers = {
-            "apikey": supabase_key,
-            "Authorization": f"Bearer {supabase_key}"
+            "apikey": SUPABASE_KEY,
+            "Authorization": f"Bearer {SUPABASE_KEY}",
+            "Content-Type": "application/json"
         }
         
-        # Query the most recent usage for this assistant
-        response = requests.get(
-            f"{supabase_url}/rest/v1/assistant_usage",
+        response = requests.post(
+            f"{SUPABASE_URL}/rest/v1/workflow_logs",
             headers=headers,
-            params={
-                "assistant_name": f"eq.{assistant_name}",
-                "order": "timestamp.desc",
-                "limit": "1"
-            },
+            json=log_data,
             timeout=10
         )
         
-        if response.status_code == 200:
-            data = response.json()
-            if data and len(data) > 0:
-                timestamp_str = data[0]['timestamp']
-                # Handle both ISO formats with and without timezone
-                if 'Z' in timestamp_str or '+' in timestamp_str:
-                    return datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
-                else:
-                    return datetime.fromisoformat(timestamp_str)
-        
-        return None
-    except requests.exceptions.Timeout:
-        logging.error(f"Timeout getting usage data for {assistant_name} from Supabase")
-        return None
-    except Exception as e:
-        logging.error(f"Error getting last usage time for {assistant_name}: {str(e)}")
-        return None
-
-def assistant_exists(pc, assistant_name):
-    """Check if an assistant exists with timeout"""
-    try:
-        def check():
-            response = pc.assistant.list_assistants()
-            # Handle different response formats
-            if hasattr(response, 'assistants'):
-                assistants_list = response.assistants
-            elif isinstance(response, dict) and 'assistants' in response:
-                assistants_list = response['assistants']
-            else:
-                # If response is already a list
-                assistants_list = response if isinstance(response, list) else []
-            
-            # Check each assistant
-            for assistant in assistants_list:
-                name = assistant.name if hasattr(assistant, 'name') else assistant.get('name')
-                if name == assistant_name:
-                    return True
+        if response.status_code not in [200, 201]:
+            logging.warning(f"Failed to send log to Supabase: {response.status_code} - {response.text}")
             return False
+            
+        return True
         
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(check)
-            return future.result(timeout=30)
-    except TimeoutError:
-        logging.error(f"Timeout checking if assistant {assistant_name} exists")
+    except requests.exceptions.Timeout:
+        logging.warning("Timeout sending log to Supabase")
         return False
     except Exception as e:
-        logging.error(f"Error checking assistant existence: {str(e)}")
+        logging.warning(f"Error sending log to Supabase: {str(e)}")
         return False
 
-def delete_assistant(pc, assistant_name):
-    """Delete an assistant with timeout and retries"""
-    for attempt in range(MAX_RETRIES):
+def log_progress(stage, message, details=None, log_type='info'):
+    """Helper function to log both locally and to Supabase."""
+    log_func = getattr(logging, log_type.lower(), logging.info)
+    log_func(f"[{stage.upper()}] {message}")
+    send_log_to_supabase(log_type, message, details)
+
+def sanitize_filename(filename):
+    """Remove or replace characters that might cause issues."""
+    filename = filename.replace(' ', '_')
+    filename = re.sub(r'[^\w\-.]', '', filename)
+    return filename
+
+def navigate_to_ftp_folder(ftp, folder_path):
+    """Navigate to FTP folder handling spaces in path names."""
+    try:
+        parts = folder_path.split('/')
+        for part in parts:
+            if part:
+                try:
+                    ftp.cwd(part)
+                    logging.info(f"Navigated to: {part}")
+                except Exception as e:
+                    logging.error(f"Failed to navigate to '{part}': {str(e)}")
+                    raise
+    except Exception as e:
+        logging.error(f"Failed to navigate to folder {folder_path}: {str(e)}")
+        raise
+
+def parse_ftp_list_line(line):
+    """
+    Parse a line from FTP LIST command to extract filename and type.
+    Returns: (filename, is_directory)
+    """
+    # Typical format: drwxrwxrwx   1 user     group           0 Dec  2 16:04 Policies
+    parts = line.split()
+    if len(parts) < 9:
+        return None, False
+    
+    # First character indicates type: 'd' for directory, '-' for file
+    is_directory = parts[0].startswith('d')
+    
+    # Filename is everything after the date/time (last parts)
+    # Join from index 8 onwards to handle filenames with spaces
+    filename = ' '.join(parts[8:])
+    
+    # Skip . and ..
+    if filename in ['.', '..']:
+        return None, False
+    
+    return filename, is_directory
+
+def get_directory_contents(ftp):
+    """
+    Get directory contents using LIST command and parse it properly.
+    Returns: (files, directories)
+    """
+    lines = []
+    ftp.retrlines('LIST', lines.append)
+    
+    files = []
+    directories = []
+    
+    for line in lines:
+        filename, is_dir = parse_ftp_list_line(line)
+        if filename:
+            if is_dir:
+                directories.append(filename)
+            else:
+                files.append(filename)
+    
+    return files, directories
+
+def verify_ftp_path(ftp, expected_path):
+    """Verify we can access the FTP path and list its contents"""
+    try:
+        current = ftp.pwd()
+        logging.info(f"📍 Current FTP directory: {current}")
+        
+        # Use our improved directory listing
+        files, directories = get_directory_contents(ftp)
+        total_items = len(files) + len(directories)
+        
+        logging.info(f"✓ Directory listing successful: {len(files)} files, {len(directories)} directories")
+        
+        # Show sample of what's there
+        if files:
+            logging.info(f"📄 Sample files: {files[:5]}")
+        if directories:
+            logging.info(f"📁 Subdirectories: {directories}")
+        
+        return True, files, directories
+    except Exception as e:
+        logging.error(f"❌ Failed to verify FTP path: {e}")
+        return False, [], []
+
+def upload_file_to_assistant(assistant, file_path, original_filename):
+    """Upload a file to Pinecone assistant with retry logic."""
+    max_retries = 3
+    retry_delay = 5
+    
+    for attempt in range(max_retries):
         try:
-            def delete():
-                pc.assistant.delete_assistant(assistant_name)
-                return True
+            # Upload file - Pinecone will use the actual file path's name
+            upload_response = assistant.upload_file(
+                file_path=file_path,
+                timeout=120
+            )
             
-            with ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(delete)
-                result = future.result(timeout=DELETE_TIMEOUT_SECONDS)
-                
-                # Verify deletion
-                time.sleep(2)
-                if not assistant_exists(pc, assistant_name):
-                    return True
-                else:
-                    logging.warning(f"Assistant {assistant_name} still exists after deletion attempt")
-                    return False
-                    
-        except TimeoutError:
-            logging.error(f"Timeout deleting {assistant_name} (attempt {attempt + 1}/{MAX_RETRIES})")
-            if attempt < MAX_RETRIES - 1:
-                time.sleep(5)
-                continue
-            return False
+            logging.info(f"✓ Successfully uploaded: {original_filename}")
+            log_progress('upload', f"Successfully uploaded: {original_filename}", {
+                'file': original_filename,
+                'attempt': attempt + 1
+            }, 'success')
+            return True
+            
         except Exception as e:
-            logging.error(f"Error deleting {assistant_name}: {str(e)} (attempt {attempt + 1}/{MAX_RETRIES})")
-            if attempt < MAX_RETRIES - 1:
-                time.sleep(5)
-                continue
-            return False
+            if attempt < max_retries - 1:
+                logging.warning(f"Upload attempt {attempt + 1} failed for {original_filename}, retrying in {retry_delay}s...")
+                time.sleep(retry_delay)
+            else:
+                logging.error(f"✗ Failed to upload {original_filename} after {max_retries} attempts: {str(e)}")
+                problematic_files['upload_failed'].append(original_filename)
+                log_progress('upload', f"Failed to upload: {original_filename}", {
+                    'file': original_filename,
+                    'error': str(e),
+                    'attempts': max_retries
+                }, 'error')
+                return False
     
     return False
 
-def cleanup_inactive_assistants(inactivity_hours=2, dry_run=False):
+def process_directory(ftp, base_path, assistant):
     """
-    Main cleanup function
-    
-    Args:
-        inactivity_hours: Delete assistants inactive for this many hours
-        dry_run: If True, only show what would be deleted without actually deleting
-    
-    Returns:
-        (deleted_count, kept_count, failed_count)
+    Process all files in the directory with comprehensive diagnostics.
+    Supports: PDF, DOCX, XLSX, PPTX, TXT, and other document formats supported by Pinecone.
     """
-    
-    # Validate environment
-    if not PINECONE_API_KEY:
-        logging.critical("PINECONE_API_KEY not set")
-        return 0, 0, 0
-    
-    if dry_run:
-        logging.info("\n" + "=" * 60)
-        logging.info("🔍 DRY RUN MODE - No assistants will be deleted")
-        logging.info("=" * 60)
-    
-    # *** SAFETY CHECK 0: Business hours protection ***
-    is_business, now, reason = is_business_hours()
-    
-    if is_business:
-        logging.warning("\n" + "=" * 60)
-        logging.warning("⚠️  BUSINESS HOURS PROTECTION ACTIVE")
-        logging.warning(reason)
-        logging.warning("Skipping cleanup to protect active assistants during business hours")
-        logging.warning("")
-        logging.warning("Cleanup will run automatically during:")
-        logging.warning("   - After 5pm UK time on weekdays")
-        logging.warning("   - Before 9am UK time tomorrow")
-        logging.warning("   - Anytime on weekends")
-        logging.warning("=" * 60)
-        return 0, 0, 0  # No deletions during business hours
-    else:
-        logging.info(f"\n✓ Safe to run cleanup: {reason}")
-    
-    # *** SAFETY CHECK 1: Check for active workflows ***
-    has_active_workflows, active_workflows = check_active_workflows(GITHUB_TOKEN, GITHUB_OWNER, GITHUB_REPO)
-    
-    if has_active_workflows:
-        logging.warning("\n" + "=" * 60)
-        logging.warning("⚠️  ACTIVE WORKFLOWS DETECTED")
-        logging.warning(f"Found {len(active_workflows)} active FTP sync workflow(s)")
-        logging.warning("Skipping cleanup to avoid deleting assistants during sync")
-        logging.warning("=" * 60)
-        for workflow in active_workflows:
-            logging.info(f"  - Workflow #{workflow.get('id')}: {workflow.get('name')}")
-            logging.info(f"    Started: {workflow.get('created_at')}")
-            logging.info(f"    Status: {workflow.get('status')}")
-        logging.warning("\n🔄 Cleanup will run again in the next scheduled execution")
-        logging.warning("=" * 60)
-        return 0, 0, 0  # No deletions
-    
-    # *** SAFETY CHECK 2: Check for activation locks ***
-    has_locks, locked_assistants = check_activation_locks(SUPABASE_URL, SUPABASE_KEY)
-    
-    if has_locks:
-        logging.warning("\n" + "=" * 60)
-        logging.warning("⚠️  ACTIVE ACTIVATION LOCKS DETECTED")
-        logging.warning(f"Found {len(locked_assistants)} assistant(s) with active locks")
-        logging.warning("These assistants are currently being activated:")
-        for assistant in locked_assistants:
-            logging.warning(f"  - {assistant}")
-        logging.warning("=" * 60)
-    
-    # Continue with cleanup
-    pc = Pinecone(api_key=PINECONE_API_KEY)
-    
-    cutoff_time = datetime.now() - timedelta(hours=inactivity_hours)
-    deleted_count = 0
-    kept_count = 0
-    failed_count = 0
-    
-    logging.info(f"\nCutoff time: {cutoff_time.isoformat()}")
-    logging.info("=" * 60)
-    
-    for assistant_name in MANAGED_ASSISTANTS:
-        logging.info(f"\nChecking: {assistant_name}")
+    try:
+        current_dir = ftp.pwd()
+        logging.info(f"📁 Processing directory: {current_dir}")
         
-        # Skip if this assistant has an active lock
-        if has_locks and assistant_name in locked_assistants:
-            logging.info(f"  Status: LOCKED (currently activating)")
-            logging.info(f"  Action: SKIPPING (assistant is being activated)")
-            kept_count += 1
-            continue
+        # Get directory contents using improved method
+        files, directories = get_directory_contents(ftp)
         
-        # Check if assistant exists
-        if not assistant_exists(pc, assistant_name):
-            logging.info(f"  Status: Does not exist (already deleted or never created)")
-            continue
+        logging.info(f"📊 Found {len(files)} files and {len(directories)} subdirectories")
         
-        logging.info(f"  Status: Currently running ($0.05/hour)")
+        # Log summary - process ALL files, not just PDFs
+        logging.info(f"📊 Directory Summary for {current_dir}:")
+        logging.info(f"  - Total Files: {len(files)}")
+        logging.info(f"  - Subdirectories: {len(directories)}")
         
-        # Get last usage time
-        last_used = get_last_usage_time(assistant_name, SUPABASE_URL, SUPABASE_KEY)
+        if files:
+            logging.info(f"📄 Files to process: {files[:10]}")  # Show first 10
+        else:
+            logging.info(f"⚠️ No files in this directory")
         
-        if last_used is None:
-            logging.warning(f"  No usage data found - keeping assistant running")
-            logging.warning(f"  (Assistant may have been created before usage tracking was enabled)")
-            kept_count += 1
-            continue
+        if directories:
+            logging.info(f"  Subdirectories: {directories}")
         
-        # Calculate time since last use
-        # Ensure both datetimes are timezone-naive for comparison
-        last_used_naive = last_used.replace(tzinfo=None) if last_used.tzinfo else last_used
-        time_since_use = datetime.now() - last_used_naive
-        hours_inactive = time_since_use.total_seconds() / 3600
-        
-        logging.info(f"  Last used: {last_used_naive.isoformat()} ({hours_inactive:.1f} hours ago)")
-        
-        # Delete if inactive too long
-        if last_used_naive < cutoff_time:
-            cost_saved_per_hour = 0.05
-            potential_savings = hours_inactive * cost_saved_per_hour
+        # Process ALL files in current directory (PDFs, DOCX, XLSX, etc.)
+        for file_to_process in files:
+            file_counters['total'] += 1
+            file_counters['processed'] += 1
             
-            if dry_run:
-                logging.info(f"  [DRY RUN] Would DELETE (inactive {hours_inactive:.1f}h)")
-                logging.info(f"  [DRY RUN] Potential savings: ${potential_savings:.2f}")
-                deleted_count += 1
-            else:
-                if delete_assistant(pc, assistant_name):
-                    logging.info(f"  Action: DELETED (inactive {hours_inactive:.1f}h)")
-                    logging.info(f"  Savings: ${cost_saved_per_hour}/hour going forward")
-                    deleted_count += 1
+            log_progress('processing', 
+                       f"Processing file {file_counters['processed']}: {file_to_process}",
+                       {'file': file_to_process, 'directory': current_dir})
+            
+            # Create temp directory
+            temp_dir = tempfile.mkdtemp()
+            # Use original filename in temp directory
+            temp_file_path = os.path.join(temp_dir, file_to_process)
+            
+            try:
+                # Download the file
+                with open(temp_file_path, 'wb') as local_file:
+                    ftp.retrbinary(f'RETR {file_to_process}', local_file.write)
+                
+                # Upload to assistant
+                if upload_file_to_assistant(assistant, temp_file_path, file_to_process):
+                    file_counters['succeeded'] += 1
                 else:
-                    logging.error(f"  Action: FAILED to delete")
-                    failed_count += 1
-        else:
-            time_until_deletion = (last_used_naive + timedelta(hours=inactivity_hours)) - datetime.now()
-            minutes_until_deletion = time_until_deletion.total_seconds() / 60
-            logging.info(f"  Action: KEEPING (still active)")
-            logging.info(f"  Will be eligible for deletion in {minutes_until_deletion:.0f} minutes")
-            kept_count += 1
-    
-    # Summary
-    logging.info("\n" + "=" * 60)
-    logging.info("Cleanup Summary")
-    logging.info("=" * 60)
-    logging.info(f"Assistants deleted: {deleted_count}")
-    logging.info(f"Assistants kept running: {kept_count}")
-    logging.info(f"Assistants failed to delete: {failed_count}")
-    
-    if deleted_count > 0:
-        hourly_savings = deleted_count * 0.05
-        daily_savings = hourly_savings * 24
-        monthly_savings = daily_savings * 30
+                    file_counters['failed'] += 1
+                    
+            except Exception as e:
+                logging.error(f"Error processing {file_to_process}: {str(e)}")
+                file_counters['failed'] += 1
+                problematic_files['processing_failed'].append(file_to_process)
+                log_progress('error', f"Error processing {file_to_process}", {
+                    'file': file_to_process,
+                    'error': str(e)
+                }, 'error')
+            finally:
+                # Clean up temp directory
+                if os.path.exists(temp_dir):
+                    shutil.rmtree(temp_dir)
         
-        if dry_run:
-            logging.info(f"\n[DRY RUN] Potential savings if these were deleted:")
-        else:
-            logging.info(f"\nCost savings:")
+        # Process subdirectories recursively
+        for subdir in directories:
+            logging.info(f"📁 Entering subdirectory: {subdir}")
+            try:
+                ftp.cwd(subdir)
+                process_directory(ftp, f"{base_path}/{subdir}", assistant)
+                ftp.cwd('..')  # Go back up
+                logging.info(f"📁 Returned from subdirectory: {subdir}")
+            except Exception as e:
+                logging.error(f"Error processing subdirectory {subdir}: {e}")
+                try:
+                    ftp.cwd('..')  # Try to go back up even if error
+                except:
+                    pass
+                
+    except Exception as e:
+        logging.error(f"Error processing directory: {str(e)}")
+        raise
+
+def generate_report():
+    """Generate a detailed report of the processing."""
+    report = {
+        'run_id': RUN_ID,
+        'assistant_name': ASSISTANT_NAME,
+        'ftp_folder': FTP_FOLDER,
+        'timestamp': datetime.now().isoformat(),
+        'summary': {
+            'total_files': file_counters['processed'],
+            'successful_uploads': file_counters['succeeded'],
+            'failed_files': file_counters['failed'],
+            'ocr_needed': len(problematic_files['ocr_needed']),
+            'password_protected': len(problematic_files['password_protected']),
+            'upload_failed': len(problematic_files['upload_failed']),
+            'processing_failed': len(problematic_files['processing_failed'])
+        },
+        'details': problematic_files
+    }
+    
+    report_file = f'{ASSISTANT_NAME}_report_{RUN_ID}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json'
+    with open(report_file, 'w') as f:
+        json.dump(report, f, indent=2)
+    
+    logging.info(f"Report generated: {report_file}")
+    log_progress('report', "Processing report generated", report['summary'])
+    
+    print("\n" + "="*60)
+    print("PROCESSING SUMMARY")
+    print("="*60)
+    print(f"Assistant: {ASSISTANT_NAME}")
+    print(f"FTP Folder: {FTP_FOLDER}")
+    print(f"Total Files: {report['summary']['total_files']}")
+    print(f"Successfully Uploaded: {report['summary']['successful_uploads']}")
+    print(f"Failed Files: {report['summary']['failed_files']}")
+    print(f"OCR Needed: {report['summary']['ocr_needed']}")
+    print(f"Password Protected: {report['summary']['password_protected']}")
+    print(f"Upload Failed: {report['summary']['upload_failed']}")
+    print(f"Processing Failed: {report['summary']['processing_failed']}")
+    print(f"Detailed report saved to: {report_file}")
+    print("="*60)
+    
+    log_progress('summary', f"FTP to Pinecone process completed for {ASSISTANT_NAME}", {
+        'run_id': RUN_ID,
+        'assistant_name': ASSISTANT_NAME,
+        'ftp_folder': FTP_FOLDER,
+        'total_files': report['summary']['total_files'],
+        'successful_uploads': report['summary']['successful_uploads'],
+        'failed_files': report['summary']['failed_files'],
+        'execution_time': f"{(datetime.now() - script_start_time).total_seconds()} seconds"
+    }, 'success')
+
+def reset_assistant(pc):
+    """Reset the Pinecone assistant by completely deleting and recreating it"""
+    try:
+        try:
+            logging.info(f"Deleting assistant: {ASSISTANT_NAME}")
+            log_progress('assistant', f"Deleting assistant: {ASSISTANT_NAME}")
+            pc.assistant.delete_assistant(ASSISTANT_NAME)
+            logging.info(f"Assistant {ASSISTANT_NAME} successfully deleted")
+            log_progress('assistant', f"Assistant {ASSISTANT_NAME} successfully deleted")
+        except Exception as e:
+            deletion_msg = f"Failed to delete assistant or assistant didn't exist: {str(e)}"
+            logging.warning(deletion_msg)
+            log_progress('assistant', deletion_msg, {}, 'warning')
+            
+        logging.info(f"Creating new assistant: {ASSISTANT_NAME}")
+        log_progress('assistant', f"Creating new assistant: {ASSISTANT_NAME}")
+        assistant = pc.assistant.create_assistant(
+            assistant_name=ASSISTANT_NAME,
+            instructions=ASSISTANT_INSTRUCTIONS,
+            region=ASSISTANT_REGION,
+            timeout=30
+        )
+        logging.info("Assistant created successfully with enhanced TBSG prompt.")
+        log_progress('assistant', "Assistant created successfully", {
+            'assistant_name': ASSISTANT_NAME,
+            'region': ASSISTANT_REGION,
+            'prompt_version': 'v2_barney_feedback'
+        }, 'success')
+        return assistant
         
-        logging.info(f"  Per hour: ${hourly_savings:.2f}")
-        logging.info(f"  Per day: ${daily_savings:.2f}")
-        logging.info(f"  Per month: ${monthly_savings:.2f}")
-    else:
-        logging.info("\nNo assistants deleted - all are either active or already deleted")
+    except Exception as e:
+        creation_error = f"Failed to create assistant: {str(e)}"
+        logging.error(creation_error)
+        log_progress('assistant', creation_error, {}, 'error')
+        raise e
+
+def main():
+    """Main execution function."""
+    global script_start_time
+    script_start_time = datetime.now()
     
-    if failed_count > 0:
-        logging.warning(f"\n⚠️  {failed_count} assistant(s) failed to delete")
-        logging.warning(f"Manual intervention may be required - check Pinecone Console")
-        logging.warning(f"URL: https://app.pinecone.io")
-    
-    logging.info("=" * 60)
-    
-    return deleted_count, kept_count, failed_count
-
-def create_usage_table_sql():
-    """Show SQL to create the assistant_usage table in Supabase"""
-    sql = """
--- Run this SQL in your Supabase SQL Editor to create the usage tracking table
-
-CREATE TABLE IF NOT EXISTS assistant_usage (
-    id BIGSERIAL PRIMARY KEY,
-    assistant_name TEXT NOT NULL,
-    action TEXT NOT NULL,
-    timestamp TIMESTAMPTZ DEFAULT NOW()
-);
-
--- Create index for fast lookups
-CREATE INDEX IF NOT EXISTS idx_assistant_usage_name_time 
-ON assistant_usage(assistant_name, timestamp DESC);
-
--- Optional: Add a comment
-COMMENT ON TABLE assistant_usage IS 'Tracks Pinecone assistant usage for automatic cleanup';
-
--- Create activation lock table
-CREATE TABLE IF NOT EXISTS assistant_activation_lock (
-    assistant_name TEXT PRIMARY KEY,
-    locked_at TIMESTAMPTZ DEFAULT NOW(),
-    locked_by TEXT,
-    workflow_run_id TEXT,
-    status TEXT DEFAULT 'activating'
-);
-
--- Create index for fast lookups
-CREATE INDEX IF NOT EXISTS idx_activation_lock_time 
-ON assistant_activation_lock(locked_at);
-
-COMMENT ON TABLE assistant_activation_lock IS 'Prevents duplicate assistant activations';
-"""
-    return sql
+    try:
+        start_msg = f"FTP to Pinecone script started for {ASSISTANT_NAME} (Run ID: {RUN_ID})"
+        logging.info(start_msg)
+        log_progress('start', start_msg)
+        
+        # Connect with TLS
+        ftp = ReusedSslFTP(FTP_SERVER, timeout=30)
+        ftp.login(FTP_USERNAME, FTP_PASSWORD)
+        ftp.prot_p()
+        ftp.set_pasv(True)
+        ftp.sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        
+        connection_msg = f"Connected to FTP server: {FTP_SERVER}"
+        logging.info(connection_msg)
+        log_progress('connect', connection_msg, {
+            'server': FTP_SERVER.replace('ftp://', '').split('@')[0]
+        }, 'success')
+        
+        # Initialize Pinecone
+        pc = Pinecone(api_key=PINECONE_API_KEY)
+        log_progress('pinecone', "Connected to Pinecone API")
+        
+        # Reset assistant
+        assistant = reset_assistant(pc)
+        
+        # Navigate to folder
+        logging.info(f"Starting file processing in {FTP_FOLDER}...")
+        log_progress('scan', f"Processing all document types in {FTP_FOLDER}")
+        
+        navigate_to_ftp_folder(ftp, FTP_FOLDER)
+        
+        # Verify path
+        logging.info("="*60)
+        logging.info("VERIFYING FTP PATH")
+        logging.info("="*60)
+        path_ok, files, directories = verify_ftp_path(ftp, FTP_FOLDER)
+        
+        if not path_ok:
+            error_msg = f"❌ Failed to verify FTP path: {FTP_FOLDER}"
+            logging.error(error_msg)
+            log_progress('error', error_msg, {'path': FTP_FOLDER}, 'error')
+            raise Exception(error_msg)
+        
+        if len(files) == 0 and len(directories) == 0:
+            warning_msg = f"⚠️ WARNING: FTP directory is completely empty"
+            logging.warning(warning_msg)
+            log_progress('warning', warning_msg, {
+                'directory': ftp.pwd(),
+                'expected_path': FTP_FOLDER
+            }, 'warning')
+        
+        logging.info("="*60)
+        
+        # Process directory
+        file_counters['total'] = 0
+        
+        max_retries = 3
+        retry_delay = 5
+        
+        for attempt in range(max_retries):
+            try:
+                if attempt > 0:
+                    ftp.quit()
+                    ftp = ReusedSslFTP(FTP_SERVER, timeout=30)
+                    ftp.login(FTP_USERNAME, FTP_PASSWORD)
+                    ftp.prot_p()
+                    ftp.set_pasv(True)
+                    ftp.sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                    logging.info(f"Reconnected to FTP server (attempt {attempt+1})")
+                    log_progress('connect', f"Reconnected to FTP server (attempt {attempt+1})")
+                
+                navigate_to_ftp_folder(ftp, FTP_FOLDER)
+                log_progress('processing', f"Starting to process files for {ASSISTANT_NAME}")
+                process_directory(ftp, FTP_FOLDER, assistant)
+                break
+            except Exception as e:
+                attempt_msg = f"Attempt {attempt + 1} failed: {str(e)}"
+                logging.error(attempt_msg)
+                log_progress('error', attempt_msg, {}, 'error')
+                if attempt == max_retries - 1:
+                    raise
+                time.sleep(retry_delay)
+        
+        generate_report()
+        ftp.quit()
+        completion_msg = f"Script completed successfully for {ASSISTANT_NAME} from {FTP_FOLDER}."
+        logging.info(completion_msg)
+        log_progress('complete', completion_msg, {
+            'execution_time': f"{(datetime.now() - script_start_time).total_seconds()} seconds",
+            'progress': {
+                'total': file_counters['total'],
+                'processed': file_counters['processed'],
+                'succeeded': file_counters['succeeded'],
+                'failed': file_counters['failed']
+            }
+        }, 'success')
+        
+    except Exception as e:
+        failure_msg = f"Script failed for {ASSISTANT_NAME}: {str(e)}"
+        logging.error(failure_msg)
+        log_progress('error', failure_msg, {
+            'stack_trace': str(e.__traceback__)
+        }, 'error')
+        raise
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description='Cleanup inactive Pinecone assistants to save costs',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Test what would be deleted (recommended first run)
-  python assistant_cleanup.py --dry-run
-  
-  # Delete assistants inactive for 2+ hours (default)
-  python assistant_cleanup.py
-  
-  # More aggressive cleanup (1 hour threshold)
-  python assistant_cleanup.py --hours 1
-  
-  # Show SQL to create Supabase tables
-  python assistant_cleanup.py --create-table
-        """
-    )
-    parser.add_argument(
-        '--hours', 
-        type=int, 
-        default=2,
-        help='Delete assistants inactive for this many hours (default: 2)'
-    )
-    parser.add_argument(
-        '--dry-run', 
-        action='store_true',
-        help='Show what would be deleted without actually deleting'
-    )
-    parser.add_argument(
-        '--create-table', 
-        action='store_true',
-        help='Show SQL to create the usage tracking table in Supabase'
-    )
-    
-    args = parser.parse_args()
-    
-    if args.create_table:
-        print(create_usage_table_sql())
-    else:
-        cleanup_inactive_assistants(
-            inactivity_hours=args.hours,
-            dry_run=args.dry_run
-        )
+    main()
