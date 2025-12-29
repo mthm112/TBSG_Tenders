@@ -1,10 +1,10 @@
-name: Generate Embeddings (TBSG v3) - Selective Tables
+name: Generate Embeddings (TBSG v3) - Enhanced
 
 on:
   workflow_dispatch:
     inputs:
       target_tables:
-        description: "Select tables to embed (comma-separated: product_master)"
+        description: "Select tables (comma-separated: product_master)"
         required: true
         default: "product_master"
         type: string
@@ -14,61 +14,185 @@ on:
         default: "0"
         type: string
       batch_size:
-        description: "Batch size for embedding"
+        description: "Batch size (default: 200)"
         required: false
-        default: "100"
+        default: "200"
         type: string
       sleep:
-        description: "Seconds to sleep between batches (rate-limit friendly)"
+        description: "Sleep between batches (default: 0.01s)"
         required: false
-        default: "0.05"
+        default: "0.01"
         type: string
       model:
-        description: "OpenAI embedding model (e.g. text-embedding-3-small)"
+        description: "OpenAI model (text-embedding-3-small)"
         required: false
         default: "text-embedding-3-small"
         type: string
+      resume:
+        description: "Resume from checkpoint?"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "true"
+          - "false"
 
 jobs:
   embed_product_master:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 480  # 8 hours for 148k rows with retries
     if: contains(github.event.inputs.target_tables, 'product_master')
+    
     env:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-      # Use your Supabase/Postgres connection string (same as your Fenns workflow)
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
-      # Optional: Script also supports this name if you prefer it later
       SUPABASE_DB_URL: ${{ secrets.DATABASE_URL }}
       OPENAI_EMBED_MODEL: ${{ github.event.inputs.model }}
       EMBED_BATCH_SIZE: ${{ github.event.inputs.batch_size }}
       EMBED_SLEEP: ${{ github.event.inputs.sleep }}
+      MAX_RETRIES: 3
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - name: Check env presence
+      - name: Validate environment variables
         run: |
-          [ -z "$DATABASE_URL" ] && { echo "❌ DATABASE_URL missing"; exit 2; } || echo "✅ DATABASE_URL OK"
-          [ -z "$OPENAI_API_KEY" ] && { echo "❌ OPENAI_API_KEY missing"; exit 2; } || echo "✅ OPENAI_API_KEY OK"
+          echo "🔍 Checking required secrets..."
+          if [ -z "$DATABASE_URL" ]; then
+            echo "❌ DATABASE_URL is missing!"
+            exit 1
+          fi
+          if [ -z "$OPENAI_API_KEY" ]; then
+            echo "❌ OPENAI_API_KEY is missing!"
+            exit 1
+          fi
+          echo "✅ All required secrets are present"
+          echo ""
+          echo "📊 Configuration:"
+          echo "  - Target: product_master"
+          echo "  - Batch size: ${{ github.event.inputs.batch_size }}"
+          echo "  - Max rows: ${{ github.event.inputs.max_rows || 'all' }}"
+          echo "  - Sleep: ${{ github.event.inputs.sleep }}s"
+          echo "  - Model: ${{ github.event.inputs.model }}"
+          echo "  - Resume: ${{ github.event.inputs.resume }}"
 
-      - uses: actions/setup-python@v5
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: 'pip'  # Cache pip dependencies
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          # If you already have requirements.txt, keep this; otherwise the fallback installs are enough.
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
           pip install --upgrade openai psycopg2-binary
+          
+          # Verify installations
+          python -c "import openai; print(f'✅ OpenAI version: {openai.__version__}')"
+          python -c "import psycopg2; print(f'✅ psycopg2 version: {psycopg2.__version__}')"
+
+      - name: Download checkpoint (if resuming)
+        if: github.event.inputs.resume == 'true'
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: embedding-checkpoint
+          path: .
 
       - name: Run embeddings for product_master
+        id: embedding
         run: |
+          echo "🚀 Starting embedding generation..."
+          echo "$(date '+%Y-%m-%d %H:%M:%S') - Begin" >> embedding_log.txt
+          
+          RESUME_FLAG=""
+          if [ "${{ github.event.inputs.resume }}" = "true" ]; then
+            RESUME_FLAG="--resume"
+          fi
+          
           python ./tbsg_embed_v3.py \
             --target "product_master" \
             --schema "public" \
-            --batch-size ${{ github.event.inputs.batch_size || '100' }} \
-            --max-rows ${{ github.event.inputs.max_rows || '0' }} \
-            --sleep ${{ github.event.inputs.sleep || '0.05' }} \
-            --progress-interval 10
+            --batch-size ${{ github.event.inputs.batch_size }} \
+            --max-rows ${{ github.event.inputs.max_rows }} \
+            --sleep ${{ github.event.inputs.sleep }} \
+            --progress-interval 5 \
+            --max-retries 3 \
+            $RESUME_FLAG \
+            2>&1 | tee -a embedding_log.txt
+          
+          echo "$(date '+%Y-%m-%d %H:%M:%S') - Complete" >> embedding_log.txt
+
+      - name: Save checkpoint artifact
+        if: always()  # Save even if job fails
+        uses: actions/upload-artifact@v4
+        with:
+          name: embedding-checkpoint
+          path: .embedding_checkpoint_*.json
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Upload execution log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: embedding-logs-${{ github.run_number }}
+          path: embedding_log.txt
+          retention-days: 30
+
+      - name: Check completion status
+        if: always()
+        run: |
+          echo "📈 Job Summary:"
+          if [ -f "embedding_log.txt" ]; then
+            grep -E "(Processed:|Failed:|Done|Fatal)" embedding_log.txt | tail -20
+          fi
+          
+          if [ -f ".embedding_checkpoint_product_master.json" ]; then
+            echo ""
+            echo "⚠️  Checkpoint file exists - job may have failed/paused"
+            echo "💡 Run again with 'Resume from checkpoint' = true"
+          else
+            echo ""
+            echo "✅ No checkpoint file - likely completed successfully"
+          fi
+
+      - name: Database health check (post-embedding)
+        if: success()
+        run: |
+          python -c "
+          import os
+          import psycopg2
+          
+          conn = psycopg2.connect(os.environ['DATABASE_URL'])
+          cur = conn.cursor()
+          
+          # Count embedded rows
+          cur.execute('''
+            SELECT 
+              COUNT(*) as total,
+              COUNT(embedding) as embedded,
+              COUNT(*) - COUNT(embedding) as remaining
+            FROM public.product_master
+          ''')
+          
+          total, embedded, remaining = cur.fetchone()
+          print(f'\n📊 Database Status:')
+          print(f'  Total rows: {total:,}')
+          print(f'  Embedded: {embedded:,} ({100*embedded/total:.1f}%)')
+          print(f'  Remaining: {remaining:,}')
+          
+          conn.close()
+          "
+
+  # Optional: Notify on completion (add if you have Slack/Discord webhook)
+  # notify:
+  #   needs: embed_product_master
+  #   runs-on: ubuntu-latest
+  #   if: always()
+  #   steps:
+  #     - name: Send notification
+  #       run: |
+  #         # Add your notification logic here
+  #         echo "Job completed with status: ${{ needs.embed_product_master.result }}"
