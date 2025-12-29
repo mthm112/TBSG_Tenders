@@ -1,0 +1,74 @@
+name: Generate Embeddings (TBSG v3) - Selective Tables
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_tables:
+        description: "Select tables to embed (comma-separated: product_master)"
+        required: true
+        default: "product_master"
+        type: string
+      max_rows:
+        description: "Maximum rows to process (0 = all)"
+        required: false
+        default: "0"
+        type: string
+      batch_size:
+        description: "Batch size for embedding"
+        required: false
+        default: "100"
+        type: string
+      sleep:
+        description: "Seconds to sleep between batches (rate-limit friendly)"
+        required: false
+        default: "0.05"
+        type: string
+      model:
+        description: "OpenAI embedding model (e.g. text-embedding-3-small)"
+        required: false
+        default: "text-embedding-3-small"
+        type: string
+
+jobs:
+  embed_product_master:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    if: contains(github.event.inputs.target_tables, 'product_master')
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      # Use your Supabase/Postgres connection string (same as your Fenns workflow)
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      # Optional: Script also supports this name if you prefer it later
+      SUPABASE_DB_URL: ${{ secrets.DATABASE_URL }}
+      OPENAI_EMBED_MODEL: ${{ github.event.inputs.model }}
+      EMBED_BATCH_SIZE: ${{ github.event.inputs.batch_size }}
+      EMBED_SLEEP: ${{ github.event.inputs.sleep }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check env presence
+        run: |
+          [ -z "$DATABASE_URL" ] && { echo "❌ DATABASE_URL missing"; exit 2; } || echo "✅ DATABASE_URL OK"
+          [ -z "$OPENAI_API_KEY" ] && { echo "❌ OPENAI_API_KEY missing"; exit 2; } || echo "✅ OPENAI_API_KEY OK"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # If you already have requirements.txt, keep this; otherwise the fallback installs are enough.
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install --upgrade openai psycopg2-binary
+
+      - name: Run embeddings for product_master
+        run: |
+          python ./tbsg_embed_v3.py \
+            --target "product_master" \
+            --schema "public" \
+            --batch-size ${{ github.event.inputs.batch_size || '100' }} \
+            --max-rows ${{ github.event.inputs.max_rows || '0' }} \
+            --sleep ${{ github.event.inputs.sleep || '0.05' }} \
+            --progress-interval 10
